@@ -22,14 +22,14 @@ def read_legacy(nodes_file, edges_file, platoons_file):
 
 class Routing:
     def __init__(self, nodes, edges):
-        self.nodes = nodes
-        self.edges = edges
+        self._nodes = nodes
+        self._edges = edges
 
         # Needed to associate nodes with an incremental sequence number (seq)
         nodes_map = nodes.reset_index()[['id']]
         nodes_map.index.name = 'seq'
         nodes_map = nodes_map.reset_index().set_index('id')
-        self.nodes_map = nodes_map
+        self._nodes_map = nodes_map
 
         # Needed to associate edges with sequential ids of from and to nodes
         edges_map = edges
@@ -39,22 +39,40 @@ class Routing:
 
         # Compute sparse graph
         # Note that from and to are inverted, so that the Johnson's algorithm returns the successor node
-        self.graph = coo_array((edges_map['length'], (edges_map['to_seq'], edges_map['from_seq'])))
+        self._graph = coo_array((edges_map['length'], (edges_map['to_seq'], edges_map['from_seq'])))
 
         # Run the Johnson's algorith
-        self.dist, self.next = johnson(self.graph, return_predecessors=True)
+        _, self._next_node = johnson(self._graph, return_predecessors=True)
+
+        # Compute the next_edge matrix
+        dgraph = coo_array((np.arange(edges_map.shape[0]), (edges_map['to_seq'], edges_map['from_seq'])))
+        to_coord = np.copy(self._next_node)
+        from_coord = np.indices((self._next_node.shape[0], self._next_node.shape[1]))[1]
+        mask = (to_coord == -9999)
+        to_coord[mask] = from_coord[mask]
+        self._next_edge = dgraph.toarray()[to_coord, from_coord]
 
     def _node_to_seq(self, node):
-        return int(self.nodes_map.loc[node]['seq'])
+        if np.isscalar(node):
+            return self._nodes_map.loc[node]['seq']
+        return self._nodes_map.loc[node]['seq'].values
 
     def _seq_to_node(self, seq):
-        return int(self.nodes_map.iloc[[seq]].index[0])
+        if np.isscalar(seq):
+            return self._nodes_map.iloc[[seq]].index.values[0]
+        return self._nodes_map.iloc[seq].index.values
 
-    def next_node(self, here, there):
+    def _seq_to_edge(self, seq):
+        if np.isscalar(seq):
+            return self._edges.iloc[[seq]].index.values[0]
+        return self._edges.iloc[seq].index.values
+
+    def next_edge(self, here, there):
         here_seq = self._node_to_seq(here)
         there_seq = self._node_to_seq(there)
-        next_seq = int(self.next[there_seq, here_seq])
-        return self._seq_to_node(next_seq), self.dist[next_seq, here_seq]
+        next_seq = self._next_node[there_seq, here_seq]
+        next_edge = self._next_edge[there_seq, here_seq]
+        return self._seq_to_edge(next_edge), self._seq_to_node(next_seq)
 
 
 if __name__ == '__main__':
