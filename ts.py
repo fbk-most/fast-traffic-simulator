@@ -1,5 +1,3 @@
-import numpy as np
-import pandas as pd
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import johnson
 from enum import Enum, auto
@@ -50,6 +48,11 @@ class Simulator:
         arrived_status = self.VehicleStatus.ARRIVED.value
 
         right_time = (self._timer == self._now)  # All elements are compared to themselves, which is always True
+
+        if not np.any(right_time):
+            # Increment the timer and exit
+            self._now += 1
+            return
 
         def do_starting():
             # Find vehicles to be updated
