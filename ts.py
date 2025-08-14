@@ -33,22 +33,14 @@ class Simulator:
     def __init__(self, vehicles):
         nr_vehicles = vehicles.shape[0]
 
-        # We could use self.VehicleStatus as type for status below, but performance would be much worse
-        # Moreover, if we ensure alignment, performance is higher
-        self._vstatus = np.zeros(nr_vehicles,
-                                 dtype=[('status', np.int32),
-                                        ('node', np.int32),
-                                        ('prev_node', np.int32),
-                                        ('destination', np.int32),
-                                        ('timer', np.int32)])
+        # Using separate arrays for each status field instead of a structured array
+        self._status = np.full(nr_vehicles, self.VehicleStatus.WAITING.value, dtype=np.int32)
+        self._node = vehicles['origin'].values.astype(np.int32)
+        self._prev_node = np.full(nr_vehicles, -1, dtype=np.int32)
+        self._destination = vehicles['destination'].values.astype(np.int32)
+        self._timer = vehicles['start'].values.astype(np.int32)
 
-        self._vstatus['status'] = self.VehicleStatus.WAITING.value
-        self._vstatus['node'] = vehicles['origin'].values
-        self._vstatus['prev_node'] = -1
-        self._vstatus['destination'] = vehicles['destination'].values
-        self._vstatus['timer'] = vehicles['start'].values
-
-        self._timer = 0
+        self._now = 0
 
     def step(self, routing):
         # Get the numeric values of the statuses
@@ -57,49 +49,49 @@ class Simulator:
         in_edge_status = self.VehicleStatus.IN_EDGE.value
         arrived_status = self.VehicleStatus.ARRIVED.value
 
-        right_time = (self._vstatus['timer'] == self._timer)
+        right_time = (self._timer == self._now)  # All elements are compared to themselves, which is always True
 
         def do_starting():
             # Find vehicles to be updated
-            starting = right_time & (self._vstatus['status'] == waiting_status)
+            starting = right_time & (self._status == waiting_status)
             # Update their status to AT_NODE
             if np.any(starting):
-                self._vstatus['status'][starting] = at_node_status
+                self._status[starting] = at_node_status
         do_starting()
 
         def do_out_of_edge():
             # Find vehicles that arrive at a node
-            out_of_edge = right_time & (self._vstatus['status'] == in_edge_status)
+            out_of_edge = right_time & (self._status == in_edge_status)
             # Update their status to AT_NODE
             if np.any(out_of_edge):
-                self._vstatus['status'][out_of_edge] = at_node_status
+                self._status[out_of_edge] = at_node_status
         do_out_of_edge()
 
         def do_arrived():
             # Find vehicles that reached their final destination
-            arrived = (right_time & (self._vstatus['status'] == at_node_status) &
-                       (self._vstatus['node'] == self._vstatus['destination']))
+            arrived = (right_time & (self._status == at_node_status) &
+                       (self._node == self._destination))
             # Update their status to ARRIVED
             if np.any(arrived):
-                self._vstatus['status'][arrived] = arrived_status
-                self._vstatus['timer'][arrived] = Simulator.END_OF_TIME
+                self._status[arrived] = arrived_status
+                self._timer[arrived] = Simulator.END_OF_TIME
         do_arrived()
 
         def do_entering_edge():
             # Find vehicles that should enter an edge
-            entering_edge = right_time & (self._vstatus['status'] == at_node_status)
+            entering_edge = right_time & (self._status == at_node_status)
             # Update their status to IN_EDGE (and define edge and next node)
             if np.any(entering_edge):
-                next_node, dist = routing.next_leg(self._vstatus['node'][entering_edge],
-                                                   self._vstatus['destination'][entering_edge])
-                self._vstatus['status'][entering_edge] = in_edge_status
-                self._vstatus['prev_node'][entering_edge] = self._vstatus['node'][entering_edge]
-                self._vstatus['node'][entering_edge] = next_node
-                self._vstatus['timer'][entering_edge] = self._timer + np.ceil(dist)
+                next_node, dist = routing.next_leg(self._node[entering_edge],
+                                                   self._destination[entering_edge])
+                self._status[entering_edge] = in_edge_status
+                self._prev_node[entering_edge] = self._node[entering_edge]
+                self._node[entering_edge] = next_node
+                self._timer[entering_edge] = self._now + np.ceil(dist)
         do_entering_edge()
 
         # Increment the timer
-        self._timer += 1
+        self._now += 1
 
 
 if __name__ == '__main__':
@@ -146,10 +138,10 @@ if __name__ == '__main__':
         for _ in range(60*60):
             simulator.step(routing)
         h += 1
-        nr_waiting = (simulator._vstatus['status'] == Simulator.VehicleStatus.WAITING.value).sum()
-        nr_at_node = (simulator._vstatus['status'] == Simulator.VehicleStatus.AT_NODE.value).sum()
-        nr_in_edge = (simulator._vstatus['status'] == Simulator.VehicleStatus.IN_EDGE.value).sum()
-        nr_arrived = (simulator._vstatus['status'] == Simulator.VehicleStatus.ARRIVED.value).sum()
+        nr_waiting = (simulator._status == Simulator.VehicleStatus.WAITING.value).sum()
+        nr_at_node = (simulator._status == Simulator.VehicleStatus.AT_NODE.value).sum()
+        nr_in_edge = (simulator._status == Simulator.VehicleStatus.IN_EDGE.value).sum()
+        nr_arrived = (simulator._status == Simulator.VehicleStatus.ARRIVED.value).sum()
         print(f"... simulation time after {h} hours: {time.time()-start_sim:.2f} seconds")
         print(f"...... waiting: {nr_waiting} vehicles")
         print(f"...... at node: {nr_at_node} vehicles")
