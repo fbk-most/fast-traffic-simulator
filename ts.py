@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import numpy as np
 from scipy.sparse import coo_array
@@ -22,8 +22,69 @@ class Routing:
 
         return next_node, dist
 
+@dataclass
+class CarFollowingQueue:
+    max_length: np.uint16
+    distances: np.ndarray = field(init=False)
+    vehicles: np.ndarray = field(init=False)
+    start: np.uint16 = 0
+    length: np.uint16 = 0
+
+    def __post_init__(self):
+        self.distances = np.full(self.max_length, -1, dtype=np.float32)
+        self.vehicles = np.full(self.max_length, -1, dtype=np.int32)
+
+    def is_empty(self) -> bool:
+        return self.length == 0
+
+    def is_full(self) -> bool:
+        return self.length == self.max_length
+
+    def add(self, vehicle: np.int32):
+        if self.start + self.length == self.max_length:
+            if self.start == 0:
+                raise RuntimeError('Queue is full')
+            self.distances[:self.length] = self.distances[self.start:]
+            self.vehicles[:self.length] = self.vehicles[self.start:]
+            self.start = 0
+        self.distances[self.start + self.length] = 0.0
+        self.vehicles[self.start + self.length] = vehicle
+        self.length += 1
+
+    def get_tail_distance(self) -> np.float32:
+        if self.length == 0:
+            raise RuntimeError('Queue is empty')
+        return self.distances[self.start + self.length - 1]
+
+    def get_head_distance(self) -> np.float32:
+        if self.length == 0:
+            raise RuntimeError('Queue is empty')
+        return self.distances[self.start]
+
+    def remove(self) -> np.int32:
+        if self.length == 0:
+            raise RuntimeError('Queue is empty')
+        vehicle = self.vehicles[self.start]
+        self.length -= 1
+        self.start = 0 if self.length == 0 else self.start+1
+        return vehicle
+
+    def step(self, speed: np.float32, delta: np.float32, max_value: np.float32):
+        if self.length == 0:
+            return
+        if self.length > 1:
+            self.distances[self.start + 1:self.start + self.length] = np.minimum(
+                self.distances[self.start + 1:self.start + self.length] + speed,
+                self.distances[self.start:self.start + self.length - 1] - delta
+            )
+        self.distances[self.start] = np.minimum(
+            self.distances[self.start] + speed,
+            max_value
+        )
+
 class Simulator:
-    MAX_DENSITY = 0.2
+    MAX_DENSITY: np.float32 = 0.2
+    DELTA: np.float32 = 1.0 / MAX_DENSITY
     END_OF_TIME = 999_999
 
     @dataclass
@@ -32,8 +93,9 @@ class Simulator:
         destination: np.ndarray
         status: np.ndarray
         node: np.ndarray
-        prev_node: np.ndarray
-        timer: np.ndarray
+        edge: np.ndarray
+        start_time: np.ndarray
+        arrival_time: np.ndarray
 
     class VehicleStatus(Enum):
         WAITING = auto()
@@ -43,40 +105,38 @@ class Simulator:
 
     @dataclass
     class EdgesRecord:
-        from_node: np.ndarray
-        to_node: np.ndarray
-        length: np.ndarray
-        speed: np.ndarray
-        lanes: np.ndarray
-        traversal_time: np.ndarray
-        capacity: np.ndarray
-        occupancy: np.ndarray
+        from_node: list[np.int32]
+        to_node: list[np.int32]
+        length: list[np.int32]
+        speed: list[np.float32]
+        lanes: list[np.int32]
+        queue: list[CarFollowingQueue]
 
 
     def __init__(self, edges, vehicles):
-        nr_vehicles = vehicles.shape[0]
+        self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
-            status = np.full(nr_vehicles, self.VehicleStatus.WAITING.value, dtype=np.int32),
+            status = np.full(self._nr_vehicles, self.VehicleStatus.WAITING.value, dtype=np.int32),
             node = vehicles['origin'].values.astype(np.int32),
-            prev_node = np.full(nr_vehicles, -1, dtype=np.int32),
+            edge = np.full(self._nr_vehicles, -1, dtype=np.int32),
             origin = vehicles['origin'].values.astype(np.int32),
             destination = vehicles['destination'].values.astype(np.int32),
-            timer = vehicles['start'].values.astype(np.int32),
+            start_time = vehicles['start'].values.astype(np.int32),
+            arrival_time = np.full(self._nr_vehicles, Simulator.END_OF_TIME, dtype=np.int32)
         )
 
-        nr_edges = edges.shape[0]
+        self._nr_edges = edges.shape[0]
+        capacity = np.maximum(np.ceil(edges['length'] * edges['lanes'] * Simulator.MAX_DENSITY).values, 1).astype(np.int32)
         self._edges = Simulator.EdgesRecord(
             from_node=edges['from'].values.astype(np.int32),
             to_node=edges['to'].values.astype(np.int32),
             length=edges['length'].values.astype(np.int32),
             speed=edges['speed'].values.astype(np.float32),
             lanes=edges['lanes'].values.astype(np.int32),
-            traversal_time=(edges['length'] / edges['speed']).values.astype(np.int32),
-            capacity=np.floor(edges['length'] * edges['lanes'] * Simulator.MAX_DENSITY).values.astype(np.int32),
-            occupancy=np.zeros(nr_edges, dtype=np.int32),
+            queue=np.array([CarFollowingQueue(c) for c in capacity]),
         )
 
-        self._nodes_to_edge_map = coo_array((range(nr_edges),(edges['from'], edges['to']))).toarray()
+        self._nodes_to_edge_map = coo_array((range(self._nr_edges),(edges['from'], edges['to']))).toarray()
 
         self._now = 0
 
@@ -87,16 +147,9 @@ class Simulator:
         in_edge_status = self.VehicleStatus.IN_EDGE.value
         arrived_status = self.VehicleStatus.ARRIVED.value
 
-        right_time = (self._vehicles.timer == self._now)  # All elements are compared to themselves, which is always True
-
-        if not np.any(right_time):
-            # Increment the timer and exit
-            self._now += 1
-            return
-
         def do_starting():
-            # Find vehicles to be updated
-            starting = right_time & (self._vehicles.status == waiting_status)
+            # Find vehicles that are ready to start
+            starting = (self._vehicles.start_time == self._now) & (self._vehicles.status == waiting_status)
             # Update their status to AT_NODE
             if np.any(starting):
                 self._vehicles.status[starting] = at_node_status
@@ -104,40 +157,50 @@ class Simulator:
 
         def do_out_of_edge():
             # Find vehicles that arrive at a node
-            out_of_edge = right_time & (self._vehicles.status == in_edge_status)
+            out_of_edge = [ self._edges.queue[e].remove()
+                            for e in range(self._nr_edges)
+                            if (self._edges.queue[e].length and
+                                self._edges.queue[e].get_head_distance() == self._edges.length[e]) ]
             # Update their status to AT_NODE
-            if np.any(out_of_edge):
-                self._vehicles.status[out_of_edge] = at_node_status
-                edge = self._nodes_to_edge_map[self._vehicles.prev_node[out_of_edge], self._vehicles.node[out_of_edge]]
-                unique_edges, counts = np.unique(edge, return_counts=True)
-                self._edges.occupancy[unique_edges] -= counts
+            self._vehicles.status[out_of_edge] = at_node_status
         do_out_of_edge()
 
         def do_arrived():
             # Find vehicles that reached their final destination
-            arrived = (right_time & (self._vehicles.status == at_node_status) &
-                       (self._vehicles.node == self._vehicles.destination))
+            arrived = ((self._vehicles.status == at_node_status) & (self._vehicles.node == self._vehicles.destination))
             # Update their status to ARRIVED
             if np.any(arrived):
                 self._vehicles.status[arrived] = arrived_status
-                self._vehicles.timer[arrived] = Simulator.END_OF_TIME
+                self._vehicles.arrival_time[arrived] = self._now
         do_arrived()
 
         def do_entering_edge():
             # Find vehicles that should enter an edge
-            entering_edge = right_time & (self._vehicles.status == at_node_status)
+            entering_edge = (self._vehicles.status == at_node_status)
             # Update their status to IN_EDGE (and define the next node)
             if np.any(entering_edge):
                 next_node, dist = routing.next_leg(self._vehicles.node[entering_edge],
                                                    self._vehicles.destination[entering_edge])
                 edge = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_node]
-                unique_edges, counts = np.unique(edge, return_counts=True)
-                self._edges.occupancy[unique_edges] += counts
-                self._vehicles.status[entering_edge] = in_edge_status
-                self._vehicles.prev_node[entering_edge] = self._vehicles.node[entering_edge]
-                self._vehicles.node[entering_edge] = next_node
-                self._vehicles.timer[entering_edge] = self._now + np.ceil(dist)
+                unique_edges, index, counts = np.unique(edge, return_index=True, return_counts=True)
+
+                for e,i in zip(unique_edges, index):
+                    if (self._edges.queue[e].length == 0 or
+                            self._edges.queue[e].get_tail_distance() >= Simulator.DELTA):
+                        # selected = entering_edge.nonzero()[0][index][available_edges]
+                        v = entering_edge.nonzero()[0][i]
+                        self._edges.queue[e].add(v)
+                        self._vehicles.status[v] = in_edge_status
+                        self._vehicles.edge[v] = e
+                        self._vehicles.node[v] = next_node[i] ### TODO: -1?
         do_entering_edge()
+
+        def do_edges():
+            for e in range(self._nr_edges):
+                if self._edges.queue[e].length:
+                    self._edges.queue[e].step(self._edges.speed[e], Simulator.DELTA, self._edges.length[e])
+            # xxx(self._edges.queue, self._edges.speed, Simulator.DELTA, self._edges.length)
+        do_edges()
 
         # Increment the timer
         self._now += 1
@@ -146,7 +209,7 @@ class Simulator:
 if __name__ == '__main__':
     import time
     from legacy import *
-    
+
     # Load data
     print("Loading data...")
     start_load = time.time()
@@ -158,7 +221,8 @@ if __name__ == '__main__':
     print(f"Data loaded in {load_time:.2f} seconds")
 
     # For quick tests, the number of vehicles can be reduced
-    # vehicles = vehicles.head(100000)
+    vehicles = vehicles.head(10000)
+    ### vehicles['start'] = 0
 
     # Convert data
     print("Converting data...")
@@ -175,7 +239,7 @@ if __name__ == '__main__':
     routing = Routing(edges=converted_edges)
     routing_time = time.time() - start_routing
     print(f"Routing initialized in {routing_time:.2f} seconds")
-    
+
     # Run simulation
     print("Starting simulation...")
     simulator = Simulator(vehicles=converted_vehicles, edges=converted_edges)
@@ -198,16 +262,6 @@ if __name__ == '__main__':
         print(f"...... in edge: {nr_in_edge} vehicles")
         print(f"...... arrived: {nr_arrived} vehicles")
 
-        # Checks
-        nr_in_edge_from_occupancy = simulator._edges.occupancy.sum()
-        if nr_in_edge_from_occupancy != nr_in_edge:
-            print(f"###### Check failed: {nr_in_edge_from_occupancy} vehicles in edge from occupancy")
-            checks_ok = False
-        nr_edges_exceeding_capacity = (simulator._edges.occupancy > simulator._edges.capacity).sum()
-        if nr_edges_exceeding_capacity != 0:
-            print(f"###### Check failed: {nr_edges_exceeding_capacity} edge where occupancy exceeds capacity")
-            checks_ok = False
-
         if nr_waiting + nr_at_node + nr_in_edge == 0:
             break
 
@@ -220,6 +274,12 @@ if __name__ == '__main__':
     print(f"Steps per second: {steps_per_second:.2f}")
     print(f"Time per step: {(sim_time/total_steps)*1000:.4f} ms")
     print(f"Total runtime: {load_time + convert_time + routing_time + sim_time:.2f} seconds")
+
+    travel_times = simulator._vehicles.arrival_time - converted_vehicles['start'].values
+    print("\n--- Travel Statistics ---")
+    print(f"Average travel time: {travel_times.mean():.2f} seconds")
+    print(f"Minimum travel time: {travel_times.min():.2f} seconds")
+    print(f"Maximum travel time: {travel_times.max():.2f} seconds")
 
     if not checks_ok:
         print("\n#### Some checks failed ####")
