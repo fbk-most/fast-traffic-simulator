@@ -110,8 +110,18 @@ class Simulator:
         length: list[np.int32]
         speed: list[np.float32]
         lanes: list[np.int32]
-        queue: list[CarFollowingQueue]
+        queue_distances: list[np.float32]
+        queue_vehicles: list[np.int32]
+        queue_start: list[np.int32]  # First cell of the queue (for a given edge)
+        queue_end: list[np.int32]    # Last cell of the queue (or, better, next cell after the last)
+        queue_front: list[np.int32]  # Front of the queue (first vehicle)
+        queue_back: list[np.int32]   # Back of the queue (last vehicle)
+        queue_speed: list[np.float32] = field(init=False)
 
+        def __post_init__(self):
+            self.queue_speed = np.full_like(self.queue_distances, 0.0, dtype=np.float32)
+            for i,s in enumerate(self.speed):
+                self.queue_speed[self.queue_start[i]:self.queue_end[i]] = s
 
     def __init__(self, edges, vehicles):
         self._nr_vehicles = vehicles.shape[0]
@@ -127,13 +137,21 @@ class Simulator:
 
         self._nr_edges = edges.shape[0]
         capacity = np.maximum(np.ceil(edges['length'] * edges['lanes'] * Simulator.MAX_DENSITY).values, 1).astype(np.int32)
+        total_capacity = capacity.sum()
+        queue_end = capacity.cumsum()
+        queue_start = np.roll(queue_end, 1); queue_start[0] = 0
         self._edges = Simulator.EdgesRecord(
             from_node=edges['from'].values.astype(np.int32),
             to_node=edges['to'].values.astype(np.int32),
             length=edges['length'].values.astype(np.int32),
             speed=edges['speed'].values.astype(np.float32),
             lanes=edges['lanes'].values.astype(np.int32),
-            queue=np.array([CarFollowingQueue(c) for c in capacity]),
+            queue_distances=np.full((total_capacity+1,), 0.0, dtype=np.float32),
+            queue_vehicles=np.full((total_capacity+1,), -1, dtype=np.int32),
+            queue_start=queue_start,
+            queue_end=queue_end,
+            queue_front=queue_start.copy(),
+            queue_back=queue_start.copy(),
         )
 
         self._nodes_to_edge_map = coo_array((range(self._nr_edges),(edges['from'], edges['to']))).toarray()
@@ -157,12 +175,16 @@ class Simulator:
 
         def do_out_of_edge():
             # Find vehicles that arrive at a node
-            out_of_edge = [ self._edges.queue[e].remove()
-                            for e in range(self._nr_edges)
-                            if (self._edges.queue[e].length and
-                                self._edges.queue[e].get_head_distance() == self._edges.length[e]) ]
+            out_of_edge = ((self._edges.queue_front != self._edges.queue_back) &
+                           (self._edges.queue_distances[self._edges.queue_front] == self._edges.length))
+            vehicles = self._edges.queue_vehicles[self._edges.queue_front[out_of_edge]]
+            self._edges.queue_front[out_of_edge] += 1
+            # Reset empty queues (commented, as performance improvement is not clear)
+            # empty = (out_of_edge & (self._edges.queue_front == self._edges.queue_back))
+            # self._edges.queue_front[empty] = self._edges.queue_start[empty]
+            # self._edges.queue_back[empty] = self._edges.queue_start[empty]
             # Update their status to AT_NODE
-            self._vehicles.status[out_of_edge] = at_node_status
+            self._vehicles.status[vehicles] = at_node_status
         do_out_of_edge()
 
         def do_arrived():
@@ -185,21 +207,36 @@ class Simulator:
                 unique_edges, index, counts = np.unique(edge, return_index=True, return_counts=True)
 
                 for e,i in zip(unique_edges, index):
-                    if (self._edges.queue[e].length == 0 or
-                            self._edges.queue[e].get_tail_distance() >= Simulator.DELTA):
-                        # selected = entering_edge.nonzero()[0][index][available_edges]
+                    if (self._edges.queue_front[e] == self._edges.queue_back[e] or
+                            self._edges.queue_distances[self._edges.queue_back[e]-1] >= Simulator.DELTA):
                         v = entering_edge.nonzero()[0][i]
-                        self._edges.queue[e].add(v)
+                        if self._edges.queue_back[e] == self._edges.queue_end[e]:
+                            if self._edges.queue_front[e] == self._edges.queue_start[e]:
+                                raise RuntimeError('Queue is full')
+                            self._edges.queue_back[e] -= self._edges.queue_front[e] - self._edges.queue_start[e]
+                            self._edges.queue_distances[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
+                                self._edges.queue_distances[self._edges.queue_front[e]:self._edges.queue_end[e]]
+                            self._edges.queue_vehicles[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
+                                self._edges.queue_vehicles[self._edges.queue_front[e]:self._edges.queue_end[e]]
+                            self._edges.queue_front[e] = self._edges.queue_start[e]
+                        self._edges.queue_distances[self._edges.queue_back[e]] = 0.0
+                        self._edges.queue_vehicles[self._edges.queue_back[e]] = v
+                        self._edges.queue_back[e] += 1
                         self._vehicles.status[v] = in_edge_status
                         self._vehicles.edge[v] = e
                         self._vehicles.node[v] = next_node[i] ### TODO: -1?
         do_entering_edge()
 
         def do_edges():
-            for e in range(self._nr_edges):
-                if self._edges.queue[e].length:
-                    self._edges.queue[e].step(self._edges.speed[e], Simulator.DELTA, self._edges.length[e])
-            # xxx(self._edges.queue, self._edges.speed, Simulator.DELTA, self._edges.length)
+            fronts = np.minimum(
+                self._edges.queue_distances[self._edges.queue_front] + self._edges.speed,
+                self._edges.length
+            )
+            self._edges.queue_distances[1:] = np.minimum(
+                self._edges.queue_distances[1:] + self._edges.queue_speed[1:],
+                self._edges.queue_distances[:-1] - Simulator.DELTA
+            )
+            self._edges.queue_distances[self._edges.queue_front] = fronts
         do_edges()
 
         # Increment the timer
@@ -220,8 +257,8 @@ if __name__ == '__main__':
     load_time = time.time() - start_load
     print(f"Data loaded in {load_time:.2f} seconds")
 
-    # For quick tests, the number of vehicles can be reduced
-    vehicles = vehicles.head(10000)
+    # For quick tests, the number of vehicles can be reduced and the start time can be lowered
+    ### vehicles = vehicles.head(10000)
     ### vehicles['start'] = 0
 
     # Convert data
@@ -247,7 +284,6 @@ if __name__ == '__main__':
     # Main timing
     start_sim = time.time()
     h = 0
-    checks_ok = True
     while True:
         for _ in range(60*60):
             simulator.step(routing)
@@ -280,6 +316,3 @@ if __name__ == '__main__':
     print(f"Average travel time: {travel_times.mean():.2f} seconds")
     print(f"Minimum travel time: {travel_times.min():.2f} seconds")
     print(f"Maximum travel time: {travel_times.max():.2f} seconds")
-
-    if not checks_ok:
-        print("\n#### Some checks failed ####")
