@@ -4,83 +4,6 @@ import numpy as np
 from scipy.sparse import coo_array
 from scipy.sparse.csgraph import johnson
 
-class Routing:
-    def __init__(self, edges):
-        self._edges = edges
-
-        # Compute sparse graph
-        # Note that from and to are inverted, so that the Johnson's algorithm returns the successor node
-        self._graph = coo_array((edges['length'] / edges['speed'], (edges['to'], edges['from']))).toarray()
-
-        # Run the Johnson's algorith
-        _, self._next_node = johnson(self._graph, return_predecessors=True)
-
-
-    def next_leg(self, node, destination):
-        next_node = self._next_node[destination, node]
-        dist = self._graph[next_node, node]
-
-        return next_node, dist
-
-@dataclass
-class CarFollowingQueue:
-    max_length: np.uint16
-    distances: np.ndarray = field(init=False)
-    vehicles: np.ndarray = field(init=False)
-    start: np.uint16 = 0
-    length: np.uint16 = 0
-
-    def __post_init__(self):
-        self.distances = np.full(self.max_length, -1, dtype=np.float32)
-        self.vehicles = np.full(self.max_length, -1, dtype=np.int32)
-
-    def is_empty(self) -> bool:
-        return self.length == 0
-
-    def is_full(self) -> bool:
-        return self.length == self.max_length
-
-    def add(self, vehicle: np.int32):
-        if self.start + self.length == self.max_length:
-            if self.start == 0:
-                raise RuntimeError('Queue is full')
-            self.distances[:self.length] = self.distances[self.start:]
-            self.vehicles[:self.length] = self.vehicles[self.start:]
-            self.start = 0
-        self.distances[self.start + self.length] = 0.0
-        self.vehicles[self.start + self.length] = vehicle
-        self.length += 1
-
-    def get_tail_distance(self) -> np.float32:
-        if self.length == 0:
-            raise RuntimeError('Queue is empty')
-        return self.distances[self.start + self.length - 1]
-
-    def get_head_distance(self) -> np.float32:
-        if self.length == 0:
-            raise RuntimeError('Queue is empty')
-        return self.distances[self.start]
-
-    def remove(self) -> np.int32:
-        if self.length == 0:
-            raise RuntimeError('Queue is empty')
-        vehicle = self.vehicles[self.start]
-        self.length -= 1
-        self.start = 0 if self.length == 0 else self.start+1
-        return vehicle
-
-    def step(self, speed: np.float32, delta: np.float32, max_value: np.float32):
-        if self.length == 0:
-            return
-        if self.length > 1:
-            self.distances[self.start + 1:self.start + self.length] = np.minimum(
-                self.distances[self.start + 1:self.start + self.length] + speed,
-                self.distances[self.start:self.start + self.length - 1] - delta
-            )
-        self.distances[self.start] = np.minimum(
-            self.distances[self.start] + speed,
-            max_value
-        )
 
 class Simulator:
     MAX_DENSITY: np.float32 = 0.2
@@ -123,7 +46,8 @@ class Simulator:
             for i,s in enumerate(self.speed):
                 self.queue_speed[self.queue_start[i]:self.queue_end[i]] = s
 
-    def __init__(self, edges, vehicles):
+    def __init__(self, edges, vehicles, *, random=False):
+        self._random = random
         self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
             status = np.full(self._nr_vehicles, self.VehicleStatus.WAITING.value, dtype=np.int32),
@@ -156,9 +80,16 @@ class Simulator:
 
         self._nodes_to_edge_map = coo_array((range(self._nr_edges),(edges['from'], edges['to']))).toarray()
 
+        # Compute the routing
+        # Note that, in the following graph, from and to are inverted,
+        # so that the Johnson's algorithm returns the successor node
+        graph = coo_array((edges['length'] / edges['speed'], (edges['to'], edges['from']))).toarray()
+        # Run the Johnson's algorith
+        _, self._next_leg = johnson(graph, return_predecessors=True)
+
         self._now = 0
 
-    def step(self, routing):
+    def step(self):
         # Get the numeric values of the statuses
         waiting_status = self.VehicleStatus.WAITING.value
         at_node_status = self.VehicleStatus.AT_NODE.value
@@ -180,9 +111,9 @@ class Simulator:
             vehicles = self._edges.queue_vehicles[self._edges.queue_front[out_of_edge]]
             self._edges.queue_front[out_of_edge] += 1
             # Reset empty queues (commented, as performance improvement is not clear)
-            # empty = (out_of_edge & (self._edges.queue_front == self._edges.queue_back))
-            # self._edges.queue_front[empty] = self._edges.queue_start[empty]
-            # self._edges.queue_back[empty] = self._edges.queue_start[empty]
+            ### empty = (out_of_edge & (self._edges.queue_front == self._edges.queue_back))
+            ### self._edges.queue_front[empty] = self._edges.queue_start[empty]
+            ### self._edges.queue_back[empty] = self._edges.queue_start[empty]
             # Update their status to AT_NODE
             self._vehicles.status[vehicles] = at_node_status
         do_out_of_edge()
@@ -201,10 +132,18 @@ class Simulator:
             entering_edge = (self._vehicles.status == at_node_status)
             # Update their status to IN_EDGE (and define the next node)
             if np.any(entering_edge):
-                next_node, dist = routing.next_leg(self._vehicles.node[entering_edge],
-                                                   self._vehicles.destination[entering_edge])
+                # Note that from and to are inverted
+                next_node = self._next_leg[self._vehicles.destination[entering_edge],
+                                           self._vehicles.node[entering_edge]]
                 edge = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_node]
-                unique_edges, index, counts = np.unique(edge, return_index=True, return_counts=True)
+
+                if self._random:
+                    order = np.arange(len(edge))
+                    np.random.shuffle(order)
+                    unique_edges, index = np.unique(edge[order], return_index=True)
+                    index = order[index]
+                else:
+                    unique_edges, index = np.unique(edge, return_index=True)
 
                 free_edges = ((self._edges.queue_front[unique_edges] == self._edges.queue_back[unique_edges]) |
                               (self._edges.queue_distances[self._edges.queue_back[unique_edges]-1] >= Simulator.DELTA))
@@ -229,26 +168,6 @@ class Simulator:
                 self._vehicles.status[vehicles] = in_edge_status
                 self._vehicles.edge[vehicles] = free_unique_edges
                 self._vehicles.node[vehicles] = next_node[index[free_edges]]
-
-                # for e,i in zip(unique_edges, index):
-                #     if (self._edges.queue_front[e] == self._edges.queue_back[e] or
-                #             self._edges.queue_distances[self._edges.queue_back[e]-1] >= Simulator.DELTA):
-                #         v = entering_edge.nonzero()[0][i]
-                #         if self._edges.queue_back[e] == self._edges.queue_end[e]:
-                #             if self._edges.queue_front[e] == self._edges.queue_start[e]:
-                #                 raise RuntimeError('Queue is full')
-                #             self._edges.queue_back[e] -= self._edges.queue_front[e] - self._edges.queue_start[e]
-                #             self._edges.queue_distances[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
-                #                 self._edges.queue_distances[self._edges.queue_front[e]:self._edges.queue_end[e]]
-                #             self._edges.queue_vehicles[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
-                #                 self._edges.queue_vehicles[self._edges.queue_front[e]:self._edges.queue_end[e]]
-                #             self._edges.queue_front[e] = self._edges.queue_start[e]
-                #         self._edges.queue_distances[self._edges.queue_back[e]] = 0.0
-                #         self._edges.queue_vehicles[self._edges.queue_back[e]] = v
-                #         self._edges.queue_back[e] += 1
-                #         self._vehicles.status[v] = in_edge_status
-                #         self._vehicles.edge[v] = e
-                #         self._vehicles.node[v] = next_node[i]
         do_entering_edge()
 
         def do_edges():
@@ -268,6 +187,9 @@ class Simulator:
 
 
 if __name__ == '__main__':
+    # Switch between randomised and deterministc behavior of he simulator
+    RANDOM=False
+
     import time
     from legacy import *
 
@@ -294,23 +216,21 @@ if __name__ == '__main__':
     convert_time = time.time() - start_convert
     print(f"Data converted in {convert_time:.2f} seconds")
 
-    # Initialize routing
-    print("Initializing routing...")
-    start_routing = time.time()
-    routing = Routing(edges=converted_edges)
-    routing_time = time.time() - start_routing
-    print(f"Routing initialized in {routing_time:.2f} seconds")
+    # Initialize the simulator
+    print("Initializing simulator...")
+    start_init = time.time()
+    simulator = Simulator(vehicles=converted_vehicles, edges=converted_edges, random=RANDOM)
+    init_time = time.time() - start_init
+    print(f"Simulator initialized in {init_time:.2f} seconds")
 
     # Run simulation
     print("Starting simulation...")
-    simulator = Simulator(vehicles=converted_vehicles, edges=converted_edges)
-
     # Main timing
     start_sim = time.time()
     h = 0
     while True:
         for _ in range(60*60):
-            simulator.step(routing)
+            simulator.step()
         h += 1
         nr_waiting = (simulator._vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
         nr_at_node = (simulator._vehicles.status == Simulator.VehicleStatus.AT_NODE.value).sum()
@@ -333,7 +253,7 @@ if __name__ == '__main__':
     print(f"Total simulation time: {sim_time:.2f} seconds")
     print(f"Steps per second: {steps_per_second:.2f}")
     print(f"Time per step: {(sim_time/total_steps)*1000:.4f} ms")
-    print(f"Total runtime: {load_time + convert_time + routing_time + sim_time:.2f} seconds")
+    print(f"Total runtime: {load_time + convert_time + init_time + sim_time:.2f} seconds")
 
     travel_times = simulator._vehicles.arrival_time - converted_vehicles['start'].values
     print("\n--- Travel Statistics ---")
