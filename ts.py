@@ -206,25 +206,49 @@ class Simulator:
                 edge = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_node]
                 unique_edges, index, counts = np.unique(edge, return_index=True, return_counts=True)
 
-                for e,i in zip(unique_edges, index):
-                    if (self._edges.queue_front[e] == self._edges.queue_back[e] or
-                            self._edges.queue_distances[self._edges.queue_back[e]-1] >= Simulator.DELTA):
-                        v = entering_edge.nonzero()[0][i]
-                        if self._edges.queue_back[e] == self._edges.queue_end[e]:
-                            if self._edges.queue_front[e] == self._edges.queue_start[e]:
-                                raise RuntimeError('Queue is full')
-                            self._edges.queue_back[e] -= self._edges.queue_front[e] - self._edges.queue_start[e]
-                            self._edges.queue_distances[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
-                                self._edges.queue_distances[self._edges.queue_front[e]:self._edges.queue_end[e]]
-                            self._edges.queue_vehicles[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
-                                self._edges.queue_vehicles[self._edges.queue_front[e]:self._edges.queue_end[e]]
-                            self._edges.queue_front[e] = self._edges.queue_start[e]
-                        self._edges.queue_distances[self._edges.queue_back[e]] = 0.0
-                        self._edges.queue_vehicles[self._edges.queue_back[e]] = v
-                        self._edges.queue_back[e] += 1
-                        self._vehicles.status[v] = in_edge_status
-                        self._vehicles.edge[v] = e
-                        self._vehicles.node[v] = next_node[i] ### TODO: -1?
+                free_edges = ((self._edges.queue_front[unique_edges] == self._edges.queue_back[unique_edges]) |
+                              (self._edges.queue_distances[self._edges.queue_back[unique_edges]-1] >= Simulator.DELTA))
+                to_shift = (free_edges & (self._edges.queue_back[unique_edges] == self._edges.queue_end[unique_edges]))
+                if np.any(to_shift):
+                    full = (to_shift & (self._edges.queue_front[unique_edges] == self._edges.queue_start[unique_edges]))
+                    if np.any(full):
+                        raise RuntimeError('Queue is full')
+                    for e in unique_edges[to_shift]:
+                        self._edges.queue_back[e] -= self._edges.queue_front[e] - self._edges.queue_start[e]
+                        self._edges.queue_distances[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
+                            self._edges.queue_distances[self._edges.queue_front[e]:self._edges.queue_end[e]]
+                        self._edges.queue_vehicles[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
+                            self._edges.queue_vehicles[self._edges.queue_front[e]:self._edges.queue_end[e]]
+                        self._edges.queue_front[e] = self._edges.queue_start[e]
+                free_unique_edges = unique_edges[free_edges]
+                vehicles = entering_edge.nonzero()[0][index[free_edges]]
+
+                self._edges.queue_distances[self._edges.queue_back[free_unique_edges]] = 0.0
+                self._edges.queue_vehicles[self._edges.queue_back[free_unique_edges]] = vehicles
+                self._edges.queue_back[free_unique_edges] += 1
+                self._vehicles.status[vehicles] = in_edge_status
+                self._vehicles.edge[vehicles] = free_unique_edges
+                self._vehicles.node[vehicles] = next_node[index[free_edges]]
+
+                # for e,i in zip(unique_edges, index):
+                #     if (self._edges.queue_front[e] == self._edges.queue_back[e] or
+                #             self._edges.queue_distances[self._edges.queue_back[e]-1] >= Simulator.DELTA):
+                #         v = entering_edge.nonzero()[0][i]
+                #         if self._edges.queue_back[e] == self._edges.queue_end[e]:
+                #             if self._edges.queue_front[e] == self._edges.queue_start[e]:
+                #                 raise RuntimeError('Queue is full')
+                #             self._edges.queue_back[e] -= self._edges.queue_front[e] - self._edges.queue_start[e]
+                #             self._edges.queue_distances[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
+                #                 self._edges.queue_distances[self._edges.queue_front[e]:self._edges.queue_end[e]]
+                #             self._edges.queue_vehicles[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
+                #                 self._edges.queue_vehicles[self._edges.queue_front[e]:self._edges.queue_end[e]]
+                #             self._edges.queue_front[e] = self._edges.queue_start[e]
+                #         self._edges.queue_distances[self._edges.queue_back[e]] = 0.0
+                #         self._edges.queue_vehicles[self._edges.queue_back[e]] = v
+                #         self._edges.queue_back[e] += 1
+                #         self._vehicles.status[v] = in_edge_status
+                #         self._vehicles.edge[v] = e
+                #         self._vehicles.node[v] = next_node[i]
         do_entering_edge()
 
         def do_edges():
@@ -258,7 +282,7 @@ if __name__ == '__main__':
     print(f"Data loaded in {load_time:.2f} seconds")
 
     # For quick tests, the number of vehicles can be reduced and the start time can be lowered
-    ### vehicles = vehicles.head(10000)
+    # vehicles = vehicles.head(100000)
     ### vehicles['start'] = 0
 
     # Convert data
