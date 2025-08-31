@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import numpy as np
 from scipy.sparse import coo_array
-from scipy.sparse.csgraph import johnson
+from scipy.sparse.csgraph import dijkstra
 
 
 class Simulator:
@@ -17,6 +17,9 @@ class Simulator:
         status: np.ndarray
         node: np.ndarray
         edge: np.ndarray
+        lane: np.ndarray
+        edge_distance: np.ndarray
+        lane_front_vehicle: np.ndarray
         start_time: np.ndarray
         arrival_time: np.ndarray
 
@@ -30,21 +33,15 @@ class Simulator:
     class EdgesRecord:
         from_node: list[np.int32]
         to_node: list[np.int32]
-        length: list[np.int32]
+        length: list[np.float32]
         speed: list[np.float32]
         lanes: list[np.int32]
-        queue_distances: list[np.float32]
-        queue_vehicles: list[np.int32]
-        queue_start: list[np.int32]  # First cell of the queue (for a given edge)
-        queue_end: list[np.int32]    # Last cell of the queue (or, better, next cell after the last)
-        queue_front: list[np.int32]  # Front of the queue (first vehicle)
-        queue_back: list[np.int32]   # Back of the queue (last vehicle)
-        queue_speed: list[np.float32] = field(init=False)
+        next_lane: list[np.int32] = field(init=False)
+        last_vehicle: np.ndarray = field(init=False)
 
         def __post_init__(self):
-            self.queue_speed = np.full_like(self.queue_distances, 0.0, dtype=np.float32)
-            for i,s in enumerate(self.speed):
-                self.queue_speed[self.queue_start[i]:self.queue_end[i]] = s
+            self.next_lane = np.zeros(self.lanes.shape[0], dtype=np.int32)
+            self.last_vehicle = np.full((self.lanes.shape[0], self.lanes.max()), -1, dtype=np.int32)
 
     def __init__(self, edges, vehicles, *, random=False):
         self._random = random
@@ -53,6 +50,9 @@ class Simulator:
             status = np.full(self._nr_vehicles, self.VehicleStatus.WAITING.value, dtype=np.int32),
             node = vehicles['origin'].values.astype(np.int32),
             edge = np.full(self._nr_vehicles, -1, dtype=np.int32),
+            lane = np.full(self._nr_vehicles, -1, dtype=np.int32),
+            lane_front_vehicle= np.full(self._nr_vehicles, -1, dtype=np.int32),
+            edge_distance = np.full(self._nr_vehicles, 0.0, dtype=np.float32),
             origin = vehicles['origin'].values.astype(np.int32),
             destination = vehicles['destination'].values.astype(np.int32),
             start_time = vehicles['start'].values.astype(np.int32),
@@ -60,36 +60,28 @@ class Simulator:
         )
 
         self._nr_edges = edges.shape[0]
-        capacity = np.maximum(np.ceil(edges['length'] * edges['lanes'] * Simulator.MAX_DENSITY).values, 1).astype(np.int32)
-        total_capacity = capacity.sum()
-        queue_end = capacity.cumsum()
-        queue_start = np.roll(queue_end, 1); queue_start[0] = 0
         self._edges = Simulator.EdgesRecord(
             from_node=edges['from'].values.astype(np.int32),
             to_node=edges['to'].values.astype(np.int32),
-            length=edges['length'].values.astype(np.int32),
+            length=edges['length'].values.astype(np.float32),
             speed=edges['speed'].values.astype(np.float32),
             lanes=edges['lanes'].values.astype(np.int32),
-            queue_distances=np.full((total_capacity+1,), 0.0, dtype=np.float32),
-            queue_vehicles=np.full((total_capacity+1,), -1, dtype=np.int32),
-            queue_start=queue_start,
-            queue_end=queue_end,
-            queue_front=queue_start.copy(),
-            queue_back=queue_start.copy(),
         )
+
+        self._max_lanes = self._edges.lanes.max()
 
         self._nodes_to_edge_map = coo_array((range(self._nr_edges),(edges['from'], edges['to']))).toarray()
 
         # Compute the routing
         # Note that, in the following graph, from and to are inverted,
-        # so that the Johnson's algorithm returns the successor node
+        # so that the Dijkstra algorithm returns the successor node
         graph = coo_array((edges['length'] / edges['speed'], (edges['to'], edges['from']))).toarray()
-        # Run the Johnson's algorith
-        _, self._next_leg = johnson(graph, return_predecessors=True)
+        # Run the Dijkstra algorith
+        _, self._next_leg = dijkstra(graph, return_predecessors=True)
 
         self._now = 0
 
-    def step(self):
+    def step(self, update_next_leg = False):
         # Get the numeric values of the statuses
         waiting_status = self.VehicleStatus.WAITING.value
         at_node_status = self.VehicleStatus.AT_NODE.value
@@ -106,14 +98,8 @@ class Simulator:
 
         def do_out_of_edge():
             # Find vehicles that arrive at a node
-            out_of_edge = ((self._edges.queue_front != self._edges.queue_back) &
-                           (self._edges.queue_distances[self._edges.queue_front] == self._edges.length))
-            vehicles = self._edges.queue_vehicles[self._edges.queue_front[out_of_edge]]
-            self._edges.queue_front[out_of_edge] += 1
-            # Reset empty queues (commented, as performance improvement is not clear)
-            ### empty = (out_of_edge & (self._edges.queue_front == self._edges.queue_back))
-            ### self._edges.queue_front[empty] = self._edges.queue_start[empty]
-            ### self._edges.queue_back[empty] = self._edges.queue_start[empty]
+            vehicles = ((self._vehicles.status == in_edge_status) &
+                        (self._vehicles.edge_distance == self._edges.length[self._vehicles.edge]))
             # Update their status to AT_NODE
             self._vehicles.status[vehicles] = at_node_status
         do_out_of_edge()
@@ -121,73 +107,109 @@ class Simulator:
         def do_arrived():
             # Find vehicles that reached their final destination
             arrived = ((self._vehicles.status == at_node_status) & (self._vehicles.node == self._vehicles.destination))
-            # Update their status to ARRIVED
             if np.any(arrived):
+                # Update their status to ARRIVED and save arrival time
                 self._vehicles.status[arrived] = arrived_status
                 self._vehicles.arrival_time[arrived] = self._now
+                # Restrict to vehicles that did not start right away (ie started and arrived at the same node)
+                arrived_not_started = arrived & (self._vehicles.edge >= 0)
+                # Restrict to vehicles that are last in their lane
+                in_out_vehicles = (self._edges.last_vehicle[
+                                       self._vehicles.edge[arrived_not_started],
+                                       self._vehicles.lane[arrived_not_started]] == arrived_not_started.nonzero()[0])
+                in_out_vehicles = arrived_not_started.nonzero()[0][in_out_vehicles]
+                # There are now no vehicles in that lane
+                self._edges.last_vehicle[self._vehicles.edge[in_out_vehicles], self._vehicles.lane[in_out_vehicles]] = -1
+                # Reset edge and lane  TODO: use arrived instead of arrived_not_started?
+                self._vehicles.edge[arrived_not_started] = -1
+                self._vehicles.lane[arrived_not_started] = -1
         do_arrived()
 
         def do_entering_edge():
             # Find vehicles that should enter an edge
             entering_edge = (self._vehicles.status == at_node_status)
-            # Update their status to IN_EDGE (and define the next node)
             if np.any(entering_edge):
+                # Compute the next node and edge
                 # Note that from and to are inverted
-                next_node = self._next_leg[self._vehicles.destination[entering_edge],
+                next_nodes = self._next_leg[self._vehicles.destination[entering_edge],
                                            self._vehicles.node[entering_edge]]
-                edge = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_node]
+                edges = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_nodes]
 
+                # Get unique edges aimed by the vehicles, and the corresponding vehicles
+                # Note: shuffling is performed in case of random simulation
                 if self._random:
-                    order = np.arange(len(edge))
+                    order = np.arange(len(edges))
                     np.random.shuffle(order)
-                    unique_edges, index = np.unique(edge[order], return_index=True)
-                    index = order[index]
+                    unique_edges, unique_vehicles = np.unique(edges[order], return_index=True)
+                    unique_vehicles = order[unique_vehicles]
                 else:
-                    unique_edges, index = np.unique(edge, return_index=True)
+                    unique_edges, unique_vehicles = np.unique(edges, return_index=True)
 
-                free_edges = ((self._edges.queue_front[unique_edges] == self._edges.queue_back[unique_edges]) |
-                              (self._edges.queue_distances[self._edges.queue_back[unique_edges]-1] >= Simulator.DELTA))
-                to_shift = (free_edges & (self._edges.queue_back[unique_edges] == self._edges.queue_end[unique_edges]))
-                if np.any(to_shift):
-                    full = (to_shift & (self._edges.queue_front[unique_edges] == self._edges.queue_start[unique_edges]))
-                    if np.any(full):
-                        raise RuntimeError('Queue is full')
-                    for e in unique_edges[to_shift]:
-                        self._edges.queue_back[e] -= self._edges.queue_front[e] - self._edges.queue_start[e]
-                        self._edges.queue_distances[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
-                            self._edges.queue_distances[self._edges.queue_front[e]:self._edges.queue_end[e]]
-                        self._edges.queue_vehicles[self._edges.queue_start[e]:self._edges.queue_back[e]] = \
-                            self._edges.queue_vehicles[self._edges.queue_front[e]:self._edges.queue_end[e]]
-                        self._edges.queue_front[e] = self._edges.queue_start[e]
+                # Restrict to free edges and corresponding vehicles
+                free_edges = ((self._edges.last_vehicle[unique_edges, self._edges.next_lane[unique_edges]] == -1) |
+                              (self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges, self._edges.next_lane[unique_edges]]] >= Simulator.DELTA))
                 free_unique_edges = unique_edges[free_edges]
-                vehicles = entering_edge.nonzero()[0][index[free_edges]]
-
-                self._edges.queue_distances[self._edges.queue_back[free_unique_edges]] = 0.0
-                self._edges.queue_vehicles[self._edges.queue_back[free_unique_edges]] = vehicles
-                self._edges.queue_back[free_unique_edges] += 1
+                vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
+                # If vehicles are last in their lane, them the lane in now empty
+                in_out_vehicles = ((self._vehicles.edge[vehicles] != -1) & (self._edges.last_vehicle[self._vehicles.edge[vehicles], self._vehicles.lane[vehicles]] == vehicles))
+                self._edges.last_vehicle[self._vehicles.edge[vehicles[in_out_vehicles]], self._vehicles.lane[vehicles[in_out_vehicles]]] = -1
+                # Update their status to IN_EDGE (and define the auxiliary fields for IN_EDGE vehicles)
                 self._vehicles.status[vehicles] = in_edge_status
                 self._vehicles.edge[vehicles] = free_unique_edges
-                self._vehicles.node[vehicles] = next_node[index[free_edges]]
-        do_entering_edge()
+                self._vehicles.lane[vehicles] = self._edges.next_lane[free_unique_edges]
+                self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
+                self._vehicles.edge_distance[vehicles] = 0.0
+                self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[free_unique_edges, self._edges.next_lane[free_unique_edges]]
+                # Update new edge
+                self._edges.last_vehicle[free_unique_edges, self._edges.next_lane[free_unique_edges]] = vehicles
+                self._edges.next_lane[free_unique_edges] = (self._edges.next_lane[free_unique_edges] + 1) % self._edges.lanes[free_unique_edges]
+        for _ in range(self._max_lanes):  # Repeat for all possible lanes
+            do_entering_edge()
 
-        def do_edges():
-            fronts = np.minimum(
-                self._edges.queue_distances[self._edges.queue_front] + self._edges.speed,
-                self._edges.length
+        def do_progress_vehicles():
+            new_edge_front = ((self._vehicles.lane_front_vehicle != -1) &
+                              (self._vehicles.edge != self._vehicles.edge[self._vehicles.lane_front_vehicle]))
+            self._vehicles.lane_front_vehicle[new_edge_front] = -1
+
+            in_edge = (self._vehicles.status == in_edge_status)
+            in_edge_front = (in_edge & (self._vehicles.lane_front_vehicle == -1))
+            in_edge_follow = (in_edge & ~ in_edge_front)
+
+            new_distance = np.minimum(
+                self._vehicles.edge_distance[in_edge_follow] + self._edges.speed[self._vehicles.edge[in_edge_follow]],
+                self._vehicles.edge_distance[self._vehicles.lane_front_vehicle[in_edge_follow]] - Simulator.DELTA,
             )
-            self._edges.queue_distances[1:] = np.minimum(
-                self._edges.queue_distances[1:] + self._edges.queue_speed[1:],
-                self._edges.queue_distances[:-1] - Simulator.DELTA
+
+            if update_next_leg:
+                def do_update_next_leg():
+                    step = new_distance - self._vehicles.edge_distance[in_edge_follow]
+                    step_edge = self._vehicles.edge[in_edge_follow]
+                    instant_speed = self._edges.speed.copy()
+                    instant_speed[step_edge] = 0.01
+                    np.add.at(instant_speed, step_edge, step)
+                    unique_edge, count_edge = np.unique(step_edge, return_counts=True)
+                    np.divide.at(instant_speed, unique_edge, count_edge)
+                    graph = coo_array((self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node))).toarray()
+                    _, self._next_leg = dijkstra(graph, return_predecessors=True)
+                    # diff = ((self._next_leg == -9999) != (self._next_leg0 == -9999))
+                    # assert not diff.any()
+                do_update_next_leg()
+
+            self._vehicles.edge_distance[in_edge_follow] = new_distance
+
+            self._vehicles.edge_distance[in_edge_front] = np.minimum(
+                self._vehicles.edge_distance[in_edge_front] + self._edges.speed[self._vehicles.edge[in_edge_front]],
+                self._edges.length[self._vehicles.edge[in_edge_front]]
             )
-            self._edges.queue_distances[self._edges.queue_front] = fronts
-        do_edges()
+
+        do_progress_vehicles()
 
         # Increment the timer
         self._now += 1
 
 
 if __name__ == '__main__':
-    # Switch between randomised and deterministc behavior of he simulator
+    # Switch between randomised and deterministic behavior of the simulator
     RANDOM=False
 
     import time
@@ -229,8 +251,8 @@ if __name__ == '__main__':
     start_sim = time.time()
     h = 0
     while True:
-        for _ in range(60*60):
-            simulator.step()
+        for s in range(60*60):
+            simulator.step(s % 300 == 299)
         h += 1
         nr_waiting = (simulator._vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
         nr_at_node = (simulator._vehicles.status == Simulator.VehicleStatus.AT_NODE.value).sum()
