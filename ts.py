@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import numpy as np
 from scipy.sparse import coo_array
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import dijkstra as shortest_path_search # dijkstra / johnson
 
 
 class Simulator:
@@ -49,12 +49,10 @@ class Simulator:
         length: list[np.float32]
         speed: list[np.float32]
         lanes: list[np.int32]
-        next_lane: list[np.int32] = field(init=False)
         last_vehicle: np.ndarray = field(init=False)
 
         def __post_init__(self):
             nr_edges = self.from_node.shape[0]
-            self.next_lane = np.zeros(nr_edges, dtype=np.int32)
             self.last_vehicle = np.empty((nr_edges, self.lanes.max()), dtype=np.int32)
             for l in range(self.lanes.max()):
                 self.last_vehicle[:, l] = np.where(self.lanes > l, -1, -2)
@@ -87,7 +85,7 @@ class Simulator:
         # so that the Dijkstra algorithm returns the successor node
         graph = coo_array((edges['length'] / edges['speed'], (edges['to'], edges['from']))).toarray()
         # Run the Dijkstra algorith
-        _, self._next_leg = dijkstra(graph, return_predecessors=True)
+        _, self._next_leg = shortest_path_search(graph, return_predecessors=True)
 
         self._now = 0
 
@@ -143,36 +141,43 @@ class Simulator:
                 # Note that from and to are inverted
                 next_nodes = self._next_leg[self._vehicles.destination[entering_edge],
                                            self._vehicles.node[entering_edge]]
-                edges = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_nodes]
+                next_edges = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_nodes]
 
                 # Get unique edges aimed by the vehicles, and the corresponding vehicles
                 # Note: shuffling is performed in case of random simulation
                 if self._random:
-                    order = np.arange(len(edges))
+                    order = np.arange(len(next_edges))
                     np.random.shuffle(order)
-                    unique_edges, unique_vehicles = np.unique(edges[order], return_index=True)
+                    unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
                     unique_vehicles = order[unique_vehicles]
                 else:
-                    unique_edges, unique_vehicles = np.unique(edges, return_index=True)
+                    unique_edges, unique_vehicles = np.unique(next_edges, return_index=True)
 
                 # Restrict to free edges and corresponding vehicles
-                free_edges = ((self._edges.last_vehicle[unique_edges, self._edges.next_lane[unique_edges]] == -1) |
-                              (self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges, self._edges.next_lane[unique_edges]]] >= Simulator.DELTA))
-                free_unique_edges = unique_edges[free_edges]
-                vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
-                # If vehicles are last in their lane, them the lane in now empty
-                in_out_vehicles = ((self._vehicles.edge[vehicles] != -1) & (self._edges.last_vehicle[self._vehicles.edge[vehicles], self._vehicles.lane[vehicles]] == vehicles))
-                self._edges.last_vehicle[self._vehicles.edge[vehicles[in_out_vehicles]], self._vehicles.lane[vehicles[in_out_vehicles]]] = -1
-                # Update their status to IN_EDGE (and define the auxiliary fields for IN_EDGE vehicles)
-                self._vehicles.status[vehicles] = in_edge_status
-                self._vehicles.edge[vehicles] = free_unique_edges
-                self._vehicles.lane[vehicles] = self._edges.next_lane[free_unique_edges]
-                self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
-                self._vehicles.edge_distance[vehicles] = 0.0
-                self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[free_unique_edges, self._edges.next_lane[free_unique_edges]]
-                # Update new edge
-                self._edges.last_vehicle[free_unique_edges, self._edges.next_lane[free_unique_edges]] = vehicles
-                self._edges.next_lane[free_unique_edges] = (self._edges.next_lane[free_unique_edges] + 1) % self._edges.lanes[free_unique_edges]
+                empty_lanes = (self._edges.last_vehicle[unique_edges] == -1)
+                clear_lanes = ((self._edges.last_vehicle[unique_edges] >= 0) &
+                               (self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]]
+                                >= Simulator.DELTA))
+                free_edges = (empty_lanes | clear_lanes).any(axis=1)
+                if free_edges.any():
+                    edges = unique_edges[free_edges]
+                    lanes = np.where(empty_lanes[free_edges].any(axis=1),
+                                     np.argmax(empty_lanes[free_edges], axis=1),
+                                     np.argmax(self._vehicles.edge_distance[self._edges.last_vehicle[edges]], axis=1))
+                    vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
+
+                    # If vehicles are last in their lane, them the lane in now empty
+                    in_out_vehicles = ((self._vehicles.edge[vehicles] != -1) & (self._edges.last_vehicle[self._vehicles.edge[vehicles], self._vehicles.lane[vehicles]] == vehicles))
+                    self._edges.last_vehicle[self._vehicles.edge[vehicles[in_out_vehicles]], self._vehicles.lane[vehicles[in_out_vehicles]]] = -1
+                    # Update their status to IN_EDGE (and define the auxiliary fields for IN_EDGE vehicles)
+                    self._vehicles.status[vehicles] = in_edge_status
+                    self._vehicles.edge[vehicles] = edges
+                    self._vehicles.lane[vehicles] = lanes
+                    self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
+                    self._vehicles.edge_distance[vehicles] = 0.0
+                    self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
+                    # Update new edge
+                    self._edges.last_vehicle[edges, lanes] = vehicles
         for _ in range(self._max_lanes):  # Repeat for all possible lanes
             do_entering_edge()
 
@@ -200,9 +205,7 @@ class Simulator:
                     unique_edge, count_edge = np.unique(step_edge, return_counts=True)
                     np.divide.at(instant_speed, unique_edge, count_edge)
                     graph = coo_array((self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node))).toarray()
-                    _, self._next_leg = dijkstra(graph, return_predecessors=True)
-                    # diff = ((self._next_leg == -9999) != (self._next_leg0 == -9999))
-                    # assert not diff.any()
+                    _, self._next_leg = shortest_path_search(graph, return_predecessors=True)
                 do_update_next_leg()
 
             self._vehicles.edge_distance[in_edge_follow] = new_distance
