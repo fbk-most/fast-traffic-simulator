@@ -134,9 +134,11 @@ class Simulator:
         do_arrived()
 
         def do_entering_edge():
-            # Find vehicles that should enter an edge
-            entering_edge = (self._vehicles.status == at_node_status)
-            if np.any(entering_edge):
+            while True:
+                # Find vehicles that should enter an edge
+                entering_edge = (self._vehicles.status == at_node_status)
+                if not np.any(entering_edge):
+                    break
                 # Compute the next node and edge
                 # Note that from and to are inverted
                 next_nodes = self._next_leg[self._vehicles.destination[entering_edge],
@@ -159,27 +161,29 @@ class Simulator:
                                (self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]]
                                 >= Simulator.DELTA))
                 free_edges = (empty_lanes | clear_lanes).any(axis=1)
-                if free_edges.any():
-                    edges = unique_edges[free_edges]
-                    lanes = np.where(empty_lanes[free_edges].any(axis=1),
-                                     np.argmax(empty_lanes[free_edges], axis=1),
-                                     np.argmax(self._vehicles.edge_distance[self._edges.last_vehicle[edges]], axis=1))
-                    vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
+                if not free_edges.any():
+                    break
 
-                    # If vehicles are last in their lane, them the lane in now empty
-                    in_out_vehicles = ((self._vehicles.edge[vehicles] != -1) & (self._edges.last_vehicle[self._vehicles.edge[vehicles], self._vehicles.lane[vehicles]] == vehicles))
-                    self._edges.last_vehicle[self._vehicles.edge[vehicles[in_out_vehicles]], self._vehicles.lane[vehicles[in_out_vehicles]]] = -1
-                    # Update their status to IN_EDGE (and define the auxiliary fields for IN_EDGE vehicles)
-                    self._vehicles.status[vehicles] = in_edge_status
-                    self._vehicles.edge[vehicles] = edges
-                    self._vehicles.lane[vehicles] = lanes
-                    self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
-                    self._vehicles.edge_distance[vehicles] = 0.0
-                    self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
-                    # Update new edge
-                    self._edges.last_vehicle[edges, lanes] = vehicles
-        for _ in range(self._max_lanes):  # Repeat for all possible lanes
-            do_entering_edge()
+                edges = unique_edges[free_edges]
+                lanes = np.where(empty_lanes[free_edges].any(axis=1),
+                                 np.argmax(empty_lanes[free_edges], axis=1),
+                                 np.argmax(self._vehicles.edge_distance[self._edges.last_vehicle[edges]], axis=1))
+                vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
+
+                # If vehicles are last in their lane, them the lane in now empty
+                in_out_vehicles = ((self._vehicles.edge[vehicles] != -1) &
+                                   (self._edges.last_vehicle[self._vehicles.edge[vehicles], self._vehicles.lane[vehicles]] == vehicles))
+                self._edges.last_vehicle[self._vehicles.edge[vehicles[in_out_vehicles]], self._vehicles.lane[vehicles[in_out_vehicles]]] = -1
+                # Update their status to IN_EDGE (and define the auxiliary fields for IN_EDGE vehicles)
+                self._vehicles.status[vehicles] = in_edge_status
+                self._vehicles.edge[vehicles] = edges
+                self._vehicles.lane[vehicles] = lanes
+                self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
+                self._vehicles.edge_distance[vehicles] = 0.0
+                self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
+                # Update new edge
+                self._edges.last_vehicle[edges, lanes] = vehicles
+        do_entering_edge()
 
         def do_progress_vehicles():
             new_edge_front = ((self._vehicles.lane_front_vehicle != -1) &
