@@ -10,24 +10,37 @@ class Simulator:
     DELTA: np.float32 = 1.0 / MAX_DENSITY
     END_OF_TIME = 999_999
 
-    @dataclass
-    class VehiclesRecord:
-        origin: np.ndarray
-        destination: np.ndarray
-        status: np.ndarray
-        node: np.ndarray
-        edge: np.ndarray
-        lane: np.ndarray
-        edge_distance: np.ndarray
-        lane_front_vehicle: np.ndarray
-        start_time: np.ndarray
-        arrival_time: np.ndarray
 
     class VehicleStatus(Enum):
         WAITING = auto()
         AT_NODE = auto()
         IN_EDGE = auto()
         ARRIVED = auto()
+
+
+    @dataclass
+    class VehiclesRecord:
+        origin: list[np.int32]
+        destination: list[np.int32]
+        start_time: list[np.int32]
+        status: list[np.int32] = field(init=False)
+        node: list[np.int32] = field(init=False)
+        edge: list[np.int32] = field(init=False)
+        lane: list[np.int32] = field(init=False)
+        edge_distance: list[np.float32] = field(init=False)
+        lane_front_vehicle: list[np.int32] = field(init=False)
+        arrival_time: list[np.int32] = field(init=False)
+
+        def __post_init__(self):
+            nr_vehicles = self.origin.shape[0]
+            self.status=np.full(nr_vehicles, Simulator.VehicleStatus.WAITING.value, dtype=np.int32)
+            self.node=self.origin.copy()
+            self.edge=np.full(nr_vehicles, -1, dtype=np.int32)
+            self.lane=np.full(nr_vehicles, -1, dtype=np.int32)
+            self.lane_front_vehicle=np.full(nr_vehicles, -1, dtype=np.int32)
+            self.edge_distance=np.full(nr_vehicles, 0.0, dtype=np.float32)
+            self.arrival_time=np.full(nr_vehicles, Simulator.END_OF_TIME, dtype=np.int32)
+
 
     @dataclass
     class EdgesRecord:
@@ -40,23 +53,20 @@ class Simulator:
         last_vehicle: np.ndarray = field(init=False)
 
         def __post_init__(self):
-            self.next_lane = np.zeros(self.lanes.shape[0], dtype=np.int32)
-            self.last_vehicle = np.full((self.lanes.shape[0], self.lanes.max()), -1, dtype=np.int32)
+            nr_edges = self.from_node.shape[0]
+            self.next_lane = np.zeros(nr_edges, dtype=np.int32)
+            self.last_vehicle = np.empty((nr_edges, self.lanes.max()), dtype=np.int32)
+            for l in range(self.lanes.max()):
+                self.last_vehicle[:, l] = np.where(self.lanes > l, -1, -2)
+
 
     def __init__(self, edges, vehicles, *, random=False):
         self._random = random
         self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
-            status = np.full(self._nr_vehicles, self.VehicleStatus.WAITING.value, dtype=np.int32),
-            node = vehicles['origin'].values.astype(np.int32),
-            edge = np.full(self._nr_vehicles, -1, dtype=np.int32),
-            lane = np.full(self._nr_vehicles, -1, dtype=np.int32),
-            lane_front_vehicle= np.full(self._nr_vehicles, -1, dtype=np.int32),
-            edge_distance = np.full(self._nr_vehicles, 0.0, dtype=np.float32),
             origin = vehicles['origin'].values.astype(np.int32),
             destination = vehicles['destination'].values.astype(np.int32),
             start_time = vehicles['start'].values.astype(np.int32),
-            arrival_time = np.full(self._nr_vehicles, Simulator.END_OF_TIME, dtype=np.int32)
         )
 
         self._nr_edges = edges.shape[0]
@@ -83,9 +93,9 @@ class Simulator:
 
     def step(self, update_next_leg = False):
         # Get the numeric values of the statuses
-        waiting_status = self.VehicleStatus.WAITING.value
-        at_node_status = self.VehicleStatus.AT_NODE.value
-        in_edge_status = self.VehicleStatus.IN_EDGE.value
+        waiting_status = Simulator.VehicleStatus.WAITING.value
+        at_node_status = Simulator.VehicleStatus.AT_NODE.value
+        in_edge_status = Simulator.VehicleStatus.IN_EDGE.value
         arrived_status = self.VehicleStatus.ARRIVED.value
 
         def do_starting():
