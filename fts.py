@@ -145,6 +145,8 @@ class Simulator:
                                            self._vehicles.node[entering_edge]]
                 next_edges = self._nodes_to_edge_map[self._vehicles.node[entering_edge], next_nodes]
 
+                assert not (next_nodes == -9999).any()
+
                 # Get unique edges aimed by the vehicles, and the corresponding vehicles
                 # Note: shuffling is performed in case of random simulation
                 if self._random:
@@ -156,19 +158,28 @@ class Simulator:
                     unique_edges, unique_vehicles = np.unique(next_edges, return_index=True)
 
                 # Restrict to free edges and corresponding vehicles
-                empty_lanes = (self._edges.last_vehicle[unique_edges] == -1)
-                clear_lanes = ((self._edges.last_vehicle[unique_edges] >= 0) &
-                               (self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]]
-                                >= Simulator.DELTA))
-                free_edges = (empty_lanes | clear_lanes).any(axis=1)
+                lane_distances = np.select(
+                    [self._edges.last_vehicle[unique_edges] == -1, self._edges.last_vehicle[unique_edges] < -1, True],
+                    [999_999.9, 0.0, self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]]])
+                free_edges = (lane_distances >= Simulator.DELTA).any(axis=1)
+                # Alternative code (note: also lanes computation needs to be changed)
+                # empty_lanes = (self._edges.last_vehicle[unique_edges] == -1)
+                # clear_lanes = ((self._edges.last_vehicle[unique_edges] >= 0) &
+                #                (self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]]
+                #                 >= Simulator.DELTA))
+                # free_edges = (empty_lanes | clear_lanes).any(axis=1)
+
                 if not free_edges.any():
                     break
 
                 edges = unique_edges[free_edges]
-                lanes = np.where(empty_lanes[free_edges].any(axis=1),
-                                 np.argmax(empty_lanes[free_edges], axis=1),
-                                 np.argmax(self._vehicles.edge_distance[self._edges.last_vehicle[edges]], axis=1))
+                lanes = np.argmax(lane_distances[free_edges], axis=1)
+                # Alternative code (if free_edges is changed)
+                # lanes = np.argmax(np.select(
+                #     [self._edges.last_vehicle[edges] == -1, self._edges.last_vehicle[edges] < -1, True],
+                #     [999_999.9, 0.0, self._vehicles.edge_distance[self._edges.last_vehicle[edges]]]), axis=1)
                 vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
+                assert not (self._edges.last_vehicle[edges, lanes] < -1).any()
 
                 # If vehicles are last in their lane, them the lane in now empty
                 in_out_vehicles = ((self._vehicles.edge[vehicles] != -1) &
@@ -221,81 +232,7 @@ class Simulator:
 
         do_progress_vehicles()
 
+        assert not (self._vehicles.edge_distance < 0.0).any()
+
         # Increment the timer
         self._now += 1
-
-
-if __name__ == '__main__':
-    # Switch between randomised and deterministic behavior of the simulator
-    RANDOM=False
-
-    import time
-    from legacy import *
-
-    # Load data
-    print("Loading data...")
-    start_load = time.time()
-    (nodes, edges, vehicles) = read_legacy('nodes__v1.csv', 'edges__v1.csv',
-                                         'platoons_size=20_reduction=0.0__v1_seed_0.parquet')
-    # TODO: Manage multi-edges
-    edges.drop_duplicates(subset=['from', 'to'], inplace=True)
-    load_time = time.time() - start_load
-    print(f"Data loaded in {load_time:.2f} seconds")
-
-    # For quick tests, the number of vehicles can be reduced and the start time can be lowered
-    # vehicles = vehicles.head(100000)
-    ### vehicles['start'] = 0
-
-    # Convert data
-    print("Converting data...")
-    start_convert = time.time()
-    nodes_map = map_nodes(nodes)
-    converted_edges = convert_edges(edges, nodes_map)
-    converted_vehicles = convert_vehicles(vehicles, nodes_map)
-    convert_time = time.time() - start_convert
-    print(f"Data converted in {convert_time:.2f} seconds")
-
-    # Initialize the simulator
-    print("Initializing simulator...")
-    start_init = time.time()
-    simulator = Simulator(vehicles=converted_vehicles, edges=converted_edges, random=RANDOM)
-    init_time = time.time() - start_init
-    print(f"Simulator initialized in {init_time:.2f} seconds")
-
-    # Run simulation
-    print("Starting simulation...")
-    # Main timing
-    start_sim = time.time()
-    h = 0
-    while True:
-        for s in range(60*60):
-            simulator.step(s % 300 == 299)
-        h += 1
-        nr_waiting = (simulator._vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
-        nr_at_node = (simulator._vehicles.status == Simulator.VehicleStatus.AT_NODE.value).sum()
-        nr_in_edge = (simulator._vehicles.status == Simulator.VehicleStatus.IN_EDGE.value).sum()
-        nr_arrived = (simulator._vehicles.status == Simulator.VehicleStatus.ARRIVED.value).sum()
-        print(f"... simulation time after {h} hours: {time.time()-start_sim:.2f} seconds")
-        print(f"...... waiting: {nr_waiting} vehicles")
-        print(f"...... at node: {nr_at_node} vehicles")
-        print(f"...... in edge: {nr_in_edge} vehicles")
-        print(f"...... arrived: {nr_arrived} vehicles")
-
-        if nr_waiting + nr_at_node + nr_in_edge == 0:
-            break
-
-    sim_time = time.time() - start_sim
-    total_steps = h*60*60
-    steps_per_second = total_steps / sim_time
-
-    print("\n--- Performance Summary ---")
-    print(f"Total simulation time: {sim_time:.2f} seconds")
-    print(f"Steps per second: {steps_per_second:.2f}")
-    print(f"Time per step: {(sim_time/total_steps)*1000:.4f} ms")
-    print(f"Total runtime: {load_time + convert_time + init_time + sim_time:.2f} seconds")
-
-    travel_times = simulator._vehicles.arrival_time - converted_vehicles['start'].values
-    print("\n--- Travel Statistics ---")
-    print(f"Average travel time: {travel_times.mean():.2f} seconds")
-    print(f"Minimum travel time: {travel_times.min():.2f} seconds")
-    print(f"Maximum travel time: {travel_times.max():.2f} seconds")

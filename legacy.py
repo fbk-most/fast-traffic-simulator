@@ -36,19 +36,3 @@ def convert_vehicles(legacy_vehicles, nodes_map):
     converted_vehicles['origin'] = converted_vehicles['origin'].apply(map_node)
     converted_vehicles['destination'] = converted_vehicles['destination'].apply(map_node)
     return pd.DataFrame(converted_vehicles)
-
-
-# def _node_to_seq(self, node):
-#     if np.isscalar(node):
-#         return self._nodes_map.loc[node]['seq']
-#     return self._nodes_map.loc[node]['seq'].values
-#
-# def _seq_to_node(self, seq):
-#     if np.isscalar(seq):
-#         return self._nodes_map.iloc[[seq]].index.values[0]
-#     return self._nodes_map.iloc[seq].index.values
-#
-# def _seq_to_edge(self, seq):
-#     if np.isscalar(seq):
-#         return self._edges.iloc[[seq]].index.values[0]
-#     return self._edges.iloc[seq].index.values
