@@ -3,8 +3,10 @@ from legacy import *
 from fts import Simulator
 
 if __name__ == '__main__':
+    # Emit verbose diagnostics in building phase
+    VERBOSE = False
     # Switch between randomised and deterministic behavior of the simulator
-    RANDOM=False
+    RANDOM = False
     # Shortest path recomputation interval
     SP = 300
     # Simulation scenario
@@ -34,6 +36,12 @@ if __name__ == '__main__':
     n_duplicated = edges.duplicated(subset=['from', 'to']).sum()
     if n_duplicated > 0:
         print(f"*** Removing {n_duplicated} multiple edges ***")
+        if VERBOSE:
+            duplicated = edges[edges.duplicated(subset=['from', 'to'], keep=False)].groupby(['from', 'to'])
+            for d,_ in duplicated:
+                print("  * Edge cluster: [",
+                      ", ".join([str(e) for e in d]),
+                      "]")
         edges.drop_duplicates(subset=['from', 'to'], inplace=True)
     load_time = time.time() - start_load
     print(f"Data loaded in {load_time:.2f} seconds")
@@ -60,6 +68,10 @@ if __name__ == '__main__':
                    (simulator._next_leg[simulator._vehicles.destination, simulator._vehicles.origin] == -9999))
     if unreachable.any():
         print(f"*** Rerouting {unreachable.sum()} vehicles with unreachable destinarions ***")
+        if VERBOSE:
+            for v in unreachable.nonzero()[0]:
+                print("  * Vehicle:",
+                      f"{vehicles.index[v]}: {vehicles.iloc[v]['origin']} -> {vehicles.iloc[v]['destination']}")
         simulator._vehicles.destination[unreachable] = simulator._vehicles.origin[unreachable]
 
     init_time = time.time() - start_init
