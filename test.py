@@ -22,12 +22,12 @@ if __name__ == '__main__':
     start_load = time.time()
 
     files = {
-        "Platoons/Highways": ['nodes__v2.csv', 'edges__v2.csv', 'platoons_size=20_reduction=0.0__v2_seed_0.parquet'],
-        "Vehicles/Highways": ['nodes__v2.csv', 'edges__v2.csv', 'platoons_size=1_reduction=0.0__v2_seed_0.parquet'],
-        "Platoons/AllRoads": ['nodes__allRoads_v1.csv', 'edges__allRoads_v1.csv',
-                              'platoons_size=20_reduction=0.0__allRoads_v1_seed_0.parquet'],
-        "Vehicles/AllRoads": ['nodes__allRoads_v1.csv', 'edges__allRoads_v1.csv',
-                              'platoons_size=1_reduction=0.0__allRoads_v1_seed_0.parquet']}
+        "Platoons/Highways": ['nodes__v3.csv', 'edges__v3.csv', 'platoons_size=20_reduction=0.0__v3_seed_0.parquet'],
+        "Vehicles/Highways": ['nodes__v3.csv', 'edges__v3.csv', 'platoons_size=1_reduction=0.0__v3_seed_0.parquet'],
+        "Platoons/AllRoads": ['nodes__allRoads_v2.csv', 'edges__allRoads_v2.csv',
+                              'platoons_size=20_reduction=0.0__allRoads_v2_seed_0.parquet'],
+        "Vehicles/AllRoads": ['nodes__allRoads_v2.csv', 'edges__allRoads_v2.csv',
+                              'platoons_size=1_reduction=0.0__allRoads_v2_seed_0.parquet']}
     directory = "data"
 
     (nodes, edges, vehicles) = read_legacy(*(directory + "/" + f for f in files[SCENARIO]))
