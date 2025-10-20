@@ -5,7 +5,7 @@ from fts import Simulator
 if __name__ == '__main__':
     # Emit verbose diagnostics in building phase
     VERBOSE = False
-    # Switch between randomised and deterministic behavior of the simulator
+    # Switch between randomized and deterministic behavior of the simulator
     RANDOM = False
     # Shortest path recomputation interval
     SP = 300
@@ -64,10 +64,17 @@ if __name__ == '__main__':
     start_init = time.time()
     simulator = Simulator(vehicles=converted_vehicles, edges=converted_edges, random=RANDOM)
     # TODO: Manage unreachable destinations!
+    destination_eq_origin = (simulator._vehicles.destination == simulator._vehicles.origin)
+    if destination_eq_origin.any():
+        print(f"*** Detecting {destination_eq_origin.sum()} vehicles with destination equal to origin ***")
+        if VERBOSE:
+            for v in destination_eq_origin.nonzero()[0]:
+                print("  * Vehicle:",
+                      f"{vehicles.index[v]}: {vehicles.iloc[v]['origin']} -> {vehicles.iloc[v]['destination']}")
     unreachable = ((simulator._vehicles.destination != simulator._vehicles.origin) &
                    (simulator._next_leg[simulator._vehicles.destination, simulator._vehicles.origin] == -9999))
     if unreachable.any():
-        print(f"*** Rerouting {unreachable.sum()} vehicles with unreachable destinarions ***")
+        print(f"*** Rerouting {unreachable.sum()} vehicles with unreachable destinations ***")
         if VERBOSE:
             for v in unreachable.nonzero()[0]:
                 print("  * Vehicle:",
