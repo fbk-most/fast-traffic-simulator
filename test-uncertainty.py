@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from fts import Simulator
 
-if __name__ == '__main__':
+def run():
     edges_file = 'data/demo_graph_adj.csv'
     vehicles_file = 'data/demo_demand.csv'
     edges = pd.read_csv(edges_file, names=['id', 'from', 'to', 'length', 'speed', 'lanes'],
@@ -38,21 +38,40 @@ if __name__ == '__main__':
 
     logs = np.array(logs)
 
-    ## LOG USAGE FROM HERE
+    return logs
 
+def vehicle_history(logs, v):
+    print(f"History of vehicle {v}")
     edge = -1
     for t in range(logs.shape[0]):
-        v = 3
         old_edge = edge
         edge = int(logs[t,v,0])
         dist = logs[t,v,1]
         if edge != old_edge:
             if edge == -1:
-                print(f"Time {t}: vehicle {v} arrives")
+                print(f"- Time {t}: vehicle {v} arrives")
             else:
-                print(f"Time {t}: vehicle {v} enters edge {edge}")
+                print(f"- Time {t}: vehicle {v} enters edge {edge}")
         if edge != -1:
-            print(f"Time {t}: vehicle {v} is at distance {dist} in edge {edge}")
+            print(f"- Time {t}: vehicle {v} is at distance {dist} in edge {edge}")
 
+def edge_history(logs, edge):
+    print(f"History of edge {edge}")
+    vehicles = set()
+    for t in range(logs.shape[0]):
+        old_vehicles = vehicles
+        vehicles = set()
+        for v in range(logs.shape[1]):
+            if logs[t,v,0] == edge:
+                vehicles.add(v)
+                if v not in old_vehicles:
+                    print(f"- Time {t}: vehicle {v} enters edge {edge}")
+                dist = logs[t,v,1]
+                print(f"- Time {t}: vehicle {v} is at distance {dist} in edge {edge}")
+        for v in old_vehicles - vehicles:
+            print(f"- Time {t}: vehicle {v} leaves edge {edge}")
 
-
+if __name__ == "__main__":
+    logs = run()
+    vehicle_history(logs, 3)
+    edge_history(logs, 7)
