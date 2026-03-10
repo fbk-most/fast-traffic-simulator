@@ -21,13 +21,13 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from collections import namedtuple
-from typing import Dict, Hashable, Literal, Optional
+from typing import Dict, Hashable, Literal, Optional, Union, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.colors as pc
 import plotly.graph_objects as go
-
+import networkx as nx
 
 # ---------------------------------------------------------------------------
 # Geometry helpers
@@ -832,137 +832,116 @@ OSMnxResult = namedtuple("OSMnxResult", [
 
 
 def from_osmnx(
-    place_or_graph,
+    place_or_graph: Union[str, nx.MultiDiGraph, None] = None,
     *,
+    bbox: Optional[Tuple[float, float, float, float]] = None,
     simplify: bool = True,
+    force_connected: bool = True,
     network_type: str = "drive",
-    default_speed: float = 13.9,
-    default_lanes: int = 1,
+    default_speed: Optional[float] = None,  # km/h
+    default_lanes: Optional[int] = None,
 ) -> OSMnxResult:
-    """Import a road network from OpenStreetMap via OSMnx.
-
-    Parameters
-    ----------
-    place_or_graph : str or networkx.MultiDiGraph
-        Place name (e.g. ``"Piedmont, California, USA"``) or an existing
-        OSMnx graph.
-    simplify : bool
-        Simplify the graph (remove degree-2 nodes, consolidate intersections).
-    network_type : str
-        OSMnx network type (``"drive"``, ``"walk"``, ``"bike"``, ``"all"``).
-    default_speed : float
-        Default free-flow speed in m/s when ``maxspeed`` tag is missing.
-    default_lanes : int
-        Default number of lanes when ``lanes`` tag is missing.
-
-    Returns
-    -------
-    OSMnxResult
-        Named tuple with fields:
-
-        - **edges_df** — DataFrame ready for :meth:`fts.Simulator.build`.
-        - **pos_projected** — ``{node: (x, y)}`` in projected CRS (metres).
-        - **pos_latlon** — ``{node: (lon, lat)}`` in EPSG:4326.
-        - **edge_geometries** — ``{edge_idx: [(lon, lat), ...]}`` for map rendering.
-    """
+    """Import a road network from OSM via OSMnx with strict NaN prevention."""
     try:
         import osmnx as ox
     except ImportError:
-        raise ImportError(
-            "osmnx is required for from_osmnx(). "
-            "Install with: pip install 'fast-traffic-simulator[map]'"
-        )
+        raise ImportError("osmnx is required. Install with: pip install 'fast-traffic-simulator[map]'")
 
-    # Download or accept graph
-    if isinstance(place_or_graph, str):
-        G = ox.graph_from_place(place_or_graph, network_type=network_type, simplify=simplify)
+    # 1. Acquire Graph
+    if place_or_graph is not None:
+        if isinstance(place_or_graph, str):
+            G = ox.graph_from_place(place_or_graph, network_type=network_type, simplify=simplify)
+        else:
+            G = place_or_graph.copy()
+            if simplify:
+                G = ox.simplify_graph(G)
+    elif bbox is not None:
+        G = ox.graph_from_bbox(bbox=bbox, network_type=network_type, simplify=simplify)
     else:
-        G = place_or_graph
-        if simplify:
-            G = ox.simplify_graph(G)
+        raise ValueError("Provide 'place_or_graph' or 'bbox'.")
 
-    # Keep unprojected copy for lat/lon
+    # 2. Force Strong Connectivity (NetworkX)
+    if force_connected:
+        nodes = max(nx.strongly_connected_components(G), key=len)
+        G = G.subgraph(nodes).copy()
+
+    # 3. Routing Metrics (Adds speed_kph and travel_time)
+    # If default_speed is None, OSMnx uses its own internal highway-type defaults.
+    G = ox.routing.add_edge_speeds(G, fallback=default_speed)
+    G = ox.routing.add_edge_travel_times(G)
+
+    # 4. Projections & Mapping
     G_ll = G
     G_proj = ox.project_graph(G)
+    osm_to_fts = {osm_id: i for i, osm_id in enumerate(G_proj.nodes)}
 
-    # Build node ID mapping (OSM IDs -> contiguous 0-indexed)
-    osm_nodes = list(G_proj.nodes)
-    osm_to_fts = {osm_id: i for i, osm_id in enumerate(osm_nodes)}
+    pos_projected = {osm_to_fts[n]: (d["x"], d["y"]) for n, d in G_proj.nodes(data=True)}
+    pos_latlon = {osm_to_fts[n]: (d["x"], d["y"]) for n, d in G_ll.nodes(data=True)}
 
-    # Positions
-    pos_projected = {}
-    pos_latlon = {}
-    for osm_id, fts_id in osm_to_fts.items():
-        d_proj = G_proj.nodes[osm_id]
-        pos_projected[fts_id] = (float(d_proj["x"]), float(d_proj["y"]))
-        d_ll = G_ll.nodes[osm_id]
-        pos_latlon[fts_id] = (float(d_ll["x"]), float(d_ll["y"]))
-
-    # Edges — deduplicate parallel edges (keep shortest per (u,v) pair)
-    # FTS Simulator uses coo_array which doesn't support parallel edges.
-    best_per_uv: dict[tuple, tuple] = {}  # (u,v) -> (length, key, data)
-    for u, v, key, data in G_proj.edges(keys=True, data=True):
+    # 5. Process Edges
+    best_per_uv = {} 
+    for u, v, k, data in G_proj.edges(keys=True, data=True):
         length = float(data.get("length", 100.0))
-        uv = (u, v)
-        if uv not in best_per_uv or length < best_per_uv[uv][0]:
-            best_per_uv[uv] = (length, key, data)
+        if (u, v) not in best_per_uv or length < best_per_uv[(u, v)][0]:
+            best_per_uv[(u, v)] = (length, k, data)
 
     rows = []
-    edge_geometries: Dict[int, list] = {}
-    idx = 0
+    edge_geometries = {}
+    
+    # Absolute fallbacks if both the graph AND the user-provided defaults are None
+    ABS_SPEED_KPH = 30.0
+    ABS_LANES = 1
 
-    for (u, v), (length, _key, data) in best_per_uv.items():
-        # Parse maxspeed
-        maxspeed = data.get("maxspeed")
-        if isinstance(maxspeed, list):
-            maxspeed = maxspeed[0]
-        if isinstance(maxspeed, str):
-            try:
-                speed = float(maxspeed) / 3.6
-            except ValueError:
-                speed = default_speed
-        elif maxspeed is not None:
-            try:
-                speed = float(maxspeed) / 3.6
-            except (ValueError, TypeError):
-                speed = default_speed
-        else:
-            speed = default_speed
-
-        # Parse lanes
-        lanes = data.get("lanes")
-        if isinstance(lanes, list):
-            lanes = lanes[0]
+    for idx, ((u, v), (length, key, data)) in enumerate(best_per_uv.items()):
+        # --- Speed Handling (km/h) ---
+        raw_speed = data.get("speed_kph")
+        if isinstance(raw_speed, list): raw_speed = raw_speed[0]
+        
         try:
-            lanes = max(1, int(lanes)) if lanes is not None else default_lanes
+            speed = float(raw_speed)
+            if np.isnan(speed): raise ValueError
         except (ValueError, TypeError):
-            lanes = default_lanes
+            speed = float(default_speed) if default_speed is not None else ABS_SPEED_KPH
+
+        # --- Lane Handling (Strict NaN Prevention) ---
+        raw_lanes = data.get("lanes")
+        # OSM lanes can be ['2', '3'] or "2" or None
+        if isinstance(raw_lanes, list):
+            raw_lanes = raw_lanes[0]
+        
+        try:
+            # Handle potential strings like "2" or even "2.0"
+            if raw_lanes is None:
+                raise ValueError
+            lanes = int(float(raw_lanes))
+        except (ValueError, TypeError):
+            # Fallback to user default, then to absolute floor
+            lanes = default_lanes if default_lanes is not None else ABS_LANES
+        
+        # Final safety check: ensure lanes is a valid positive integer
+        if lanes is None or (isinstance(lanes, float) and np.isnan(lanes)):
+            lanes = ABS_LANES
+        lanes = max(1, int(lanes))
 
         rows.append({
             "from": osm_to_fts[u],
             "to": osm_to_fts[v],
             "length": length,
-            "speed": speed,
-            "lanes": lanes,
+            "speed": float(speed),
+            "lanes": int(lanes),
         })
 
-        # Store lat/lon geometry for map rendering
+        # Geometry for rendering
         u_ll, v_ll = G_ll.nodes[u], G_ll.nodes[v]
         try:
-            ll_data = G_ll.edges[u, v, _key]
-            if "geometry" in ll_data:
-                coords = list(ll_data["geometry"].coords)
-            else:
-                coords = [(u_ll["x"], u_ll["y"]), (v_ll["x"], v_ll["y"])]
-        except (KeyError, AttributeError):
+            ll_data = G_ll.edges[u, v, key]
+            coords = list(ll_data["geometry"].coords) if "geometry" in ll_data else [(u_ll["x"], u_ll["y"]), (v_ll["x"], v_ll["y"])]
+        except:
             coords = [(u_ll["x"], u_ll["y"]), (v_ll["x"], v_ll["y"])]
         edge_geometries[idx] = coords
-        idx += 1
-
-    edges_df = pd.DataFrame(rows)
 
     return OSMnxResult(
-        edges_df=edges_df,
+        edges_df=pd.DataFrame(rows),
         pos_projected=pos_projected,
         pos_latlon=pos_latlon,
         edge_geometries=edge_geometries,
@@ -1238,7 +1217,7 @@ def animate_occupancy(
     logs: np.ndarray,
     pos: Optional[Dict[Hashable, tuple]] = None,
     *,
-    capacity: Optional[np.ndarray | int | float] = None,
+    capacity: Optional[np.ndarray | int | str | float] = None,
     play_fps: int = 5,
     edge_width: float = 5.0,
     tween: bool = True,
@@ -1303,6 +1282,14 @@ def animate_occupancy(
     if capacity is None:
         cap = occupancy.max(axis=0).astype(float)
         cap = np.where(cap > 0, cap, 1.0)
+    elif capacity == "DELTA":
+        from fts import Simulator as _Simulator
+        delta = float(_Simulator.DELTA)
+        L = edges_df["length"].values.astype(float)
+        lanes = edges_df["lanes"].values.astype(int)
+        nmax_lane = np.floor(L / delta).astype(int) + 1
+        nmax = np.maximum(1, lanes * nmax_lane)
+        cap = nmax.astype(float)
     elif np.isscalar(capacity):
         cap = np.full(n_edges, float(capacity))
     else:
@@ -1466,7 +1453,7 @@ def animate_occupancy_map(
     logs: np.ndarray,
     pos_latlon: Dict[Hashable, tuple],
     *,
-    capacity: Optional[np.ndarray | int | float] = None,
+    capacity: Optional[np.ndarray | int | str | float] = None,
     play_fps: int = 5,
     edge_width: float = 4.0,
     edge_geometries: Optional[Dict[int, list]] = None,
@@ -1535,6 +1522,14 @@ def animate_occupancy_map(
     if capacity is None:
         cap = occupancy.max(axis=0).astype(float)
         cap = np.where(cap > 0, cap, 1.0)
+    elif capacity == "DELTA":
+        from fts import Simulator as _Simulator
+        delta = float(_Simulator.DELTA)
+        L = edges_df["length"].values.astype(float)
+        lanes = edges_df["lanes"].values.astype(int)
+        nmax_lane = np.floor(L / delta).astype(int) + 1
+        nmax = np.maximum(1, lanes * nmax_lane)
+        cap = nmax.astype(float)
     elif np.isscalar(capacity):
         cap = np.full(n_edges, float(capacity))
     else:

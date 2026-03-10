@@ -87,9 +87,9 @@ pos = {
 }
 
 vehicles = pd.DataFrame({
-    "origin":      [0, 0, 0, 6, 6, 6, 3, 3, 8, 8],
-    "destination": [8, 5, 2, 2, 8, 5, 8, 2, 0, 3],
-    "start":       [0, 2, 4, 0, 3, 5, 1, 6, 0, 2],
+    "origin":      [0, 0, 0, 6, 6, 6, 3, 3, 8, 8]*20,
+    "destination": [8, 5, 2, 2, 8, 5, 8, 2, 0, 3]*20,
+    "start":       [0, 2, 4, 0, 3, 5, 1, 6, 0, 2]*20,
 })
 
 simulator, _ = Simulator.build(edges=edges, vehicles=vehicles)
@@ -116,6 +116,7 @@ print(f"  -> {OUT_DIR}/animation_subset.html")
 
 # Occupancy heatmap animation (green → yellow → red)
 fig_occ_anim = animate_occupancy(edges, logs, pos, play_fps=5,
+                                 capacity="DELTA",
                                  traffic_rule="right")
 fig_occ_anim.write_html(os.path.join(OUT_DIR, "occupancy_animation.html"))
 print(f"  -> {OUT_DIR}/occupancy_animation.html")
@@ -135,7 +136,7 @@ try:
     from fts.visualization import animate_map, animate_occupancy_map, from_osmnx
 
     # Download a small neighbourhood
-    result = from_osmnx("Piedmont, California, USA", network_type="drive")
+    result = from_osmnx("Piedmont, California, USA", network_type="drive", force_connected='strong')
     edges_osm = result.edges_df
     pos_proj = result.pos_projected
     pos_ll = result.pos_latlon
@@ -146,7 +147,7 @@ try:
     # Random vehicles
     n_nodes = len(pos_proj)
     rng = np.random.default_rng(42)
-    n_trips = 20
+    n_trips = 2000
     origins = rng.integers(0, n_nodes, size=n_trips)
     destinations = rng.integers(0, n_nodes, size=n_trips)
     for i in range(n_trips):
@@ -173,6 +174,7 @@ try:
         edges_osm, osm_logs, pos_ll,
         edge_geometries=edge_geoms,
         play_fps=5,
+        vehicle_ids=list(rng.choice(osm_logs.shape[1], size=500, replace=False))
     )
     fig_map.write_html(os.path.join(OUT_DIR, "map_animation.html"))
     print(f"  -> {OUT_DIR}/map_animation.html")
@@ -185,6 +187,7 @@ try:
     # Occupancy heatmap animation on map
     fig_occ_map = animate_occupancy_map(
         edges_osm, osm_logs, pos_ll,
+        capacity="DELTA",
         edge_geometries=edge_geoms,
         play_fps=5,
     )
@@ -194,7 +197,7 @@ try:
     # Edge occupancy (top 10 busiest edges)
     fig_occ_osm = plot_edge_occupancy(
         osm_logs, edges_osm,
-        edge_indices=list(range(min(10, len(edges_osm)))),
+        edge_indices=list(range(min(10, len(edges_osm))))+[715, 541, 97, 540, 95, 93, 121, 156, 324, 326, 323, 866],
     )
     fig_occ_osm.update_layout(title="OSMnx Network - Edge Occupancy")
     fig_occ_osm.write_html(os.path.join(OUT_DIR, "map_edge_occupancy.html"))
