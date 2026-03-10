@@ -2,5 +2,5 @@
 
 from fts.simulator import Simulator
 
-__all__ = ["Simulator"]
+__all__ = ["Simulator", "visualization"]
 __version__ = "0.1.0"

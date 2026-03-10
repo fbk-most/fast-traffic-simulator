@@ -24,7 +24,12 @@ dependencies = [
     "scipy>=1.10",
     "pandas>=2.0",
     "pyarrow>=14.0",
+    "plotly>=6.6.0",
+    "networkx>=3.6.1",
 ]
+
+[project.optional-dependencies]
+map = ["osmnx>=2.0", "matplotlib>=3.7", "contextily>=1.4"]
 
 [project.urls]
 Homepage = "https://github.com/fbk-most/FastTrafficSimulator"
