@@ -21,6 +21,7 @@ from fts import Simulator
 from fts.visualization import (
     animate,
     animate_occupancy,
+    animate_occupancy_mpl,
     plot_edge_occupancy,
     plot_network,
 )
@@ -114,12 +115,22 @@ fig_anim_sub = animate(edges, logs, pos, play_fps=5, tween=True,
 fig_anim_sub.write_html(os.path.join(OUT_DIR, "animation_subset.html"))
 print(f"  -> {OUT_DIR}/animation_subset.html")
 
-# Occupancy heatmap animation (green → yellow → red)
+# Occupancy heatmap animation (green -> yellow -> red)
 fig_occ_anim = animate_occupancy(edges, logs, pos, play_fps=5,
                                  capacity="DELTA",
                                  traffic_rule="right")
 fig_occ_anim.write_html(os.path.join(OUT_DIR, "occupancy_animation.html"))
 print(f"  -> {OUT_DIR}/occupancy_animation.html")
+
+# Matplotlib occupancy animation (mp4 export)
+try:
+    anim_mpl = animate_occupancy_mpl(edges, logs, pos, play_fps=10,
+                                     capacity="DELTA",
+                                     traffic_rule="right",
+                                     save_path=os.path.join(OUT_DIR, "occupancy.mp4"))
+    print(f"  -> {OUT_DIR}/occupancy.mp4")
+except Exception as e:
+    print(f"  Skipping mp4 export ({e})")
 
 # Edge occupancy
 fig_occ = plot_edge_occupancy(logs, edges)
@@ -133,7 +144,7 @@ print(f"  -> {OUT_DIR}/edge_occupancy.html")
 # ═══════════════════════════════════════════════════════════════════════════
 
 try:
-    from fts.visualization import animate_map, animate_occupancy_map, from_osmnx
+    from fts.visualization import from_osmnx
 
     # Download a small neighbourhood
     result = from_osmnx("Piedmont, California, USA", network_type="drive", force_connected='strong')
@@ -169,9 +180,9 @@ try:
     osm_logs, _ = run_and_log(sim_osm, vehicles_osm)
     print(f"  Simulation: {osm_logs.shape[0]} steps, {osm_logs.shape[1]} vehicles")
 
-    # Plotly map animation
-    fig_map = animate_map(
-        edges_osm, osm_logs, pos_ll,
+    # Plotly map animation (unified — uses pos_latlon)
+    fig_map = animate(
+        edges_osm, osm_logs, pos_latlon=pos_ll,
         edge_geometries=edge_geoms,
         play_fps=5,
         vehicle_ids=list(rng.choice(osm_logs.shape[1], size=500, replace=False))
@@ -184,15 +195,31 @@ try:
     fig_net_osm.write_html(os.path.join(OUT_DIR, "map_network.html"))
     print(f"  -> {OUT_DIR}/map_network.html")
 
-    # Occupancy heatmap animation on map
-    fig_occ_map = animate_occupancy_map(
-        edges_osm, osm_logs, pos_ll,
+    # Occupancy heatmap animation on map (unified — uses pos_latlon)
+    fig_occ_map = animate_occupancy(
+        edges_osm, osm_logs, pos_latlon=pos_ll,
         capacity="DELTA",
         edge_geometries=edge_geoms,
         play_fps=5,
     )
     fig_occ_map.write_html(os.path.join(OUT_DIR, "map_occupancy_animation.html"))
     print(f"  -> {OUT_DIR}/map_occupancy_animation.html")
+
+    # Matplotlib occupancy on map (mp4 export)
+    try:
+        anim_map_mpl = animate_occupancy_mpl(
+            edges_osm, osm_logs, pos_proj,
+            capacity="DELTA",
+            edge_geometries={
+                i: [(c[0], c[1]) for c in coords]
+                for i, coords in result.edge_geometries_projected.items()
+            } if result.edge_geometries_projected else None,
+            crs=result.crs or "EPSG:3857",
+            save_path=os.path.join(OUT_DIR, "map_occupancy.mp4"),
+        )
+        print(f"  -> {OUT_DIR}/map_occupancy.mp4")
+    except Exception as e:
+        print(f"  Skipping map occupancy mp4 ({e})")
 
     # Edge occupancy (top 10 busiest edges)
     fig_occ_osm = plot_edge_occupancy(
