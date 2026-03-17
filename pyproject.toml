@@ -26,6 +26,9 @@ dependencies = [
     "pyarrow>=14.0",
     "plotly>=6.6.0",
     "networkx>=3.6.1",
+    "salib>=1.5.2",
+    "dash>=4.0.0",
+    "osmnx>=2.1.0",
 ]
 
 [project.optional-dependencies]

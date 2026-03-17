@@ -482,6 +482,7 @@ def animate(
     edge_geometries: Optional[Dict[int, list]] = None,
     map_style: str = "open-street-map",
     map_zoom: Optional[int] = None,
+    map_center: Optional[tuple] = None,
     play_fps: int = 5,
     marker_size: int = 8,
     lane_offset: float = 0.06,
@@ -526,6 +527,9 @@ def animate(
         Map tile style for map mode.
     map_zoom : int or None
         Initial zoom level for map mode.  Auto-computed if *None*.
+    map_center : tuple or None
+        ``(lon, lat)`` for the initial map centre.  Defaults to the
+        centroid of all nodes.
     play_fps : int
         Playback frames per second.
     marker_size : int
@@ -594,7 +598,10 @@ def animate(
         # --- map centre & zoom ---
         lats = [pos_latlon[n][1] for n in pos_latlon]
         lons = [pos_latlon[n][0] for n in pos_latlon]
-        center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
+        if map_center is not None:
+            center_lat, center_lon = float(map_center[1]), float(map_center[0])
+        else:
+            center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
         if map_zoom is None:
             max_range = max(max(lats) - min(lats), max(lons) - min(lons))
             map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
@@ -1018,7 +1025,10 @@ def from_osmnx(
     default_speed: Optional[float] = None,  # km/h
     default_lanes: Optional[int] = None,
 ) -> OSMnxResult:
-    """Import a road network from OSM via OSMnx with strict NaN prevention."""
+    """Import a road network from OSM via OSMnx with strict NaN prevention.
+    
+    bbox format: (west, south, east, north)
+    """
     try:
         import osmnx as ox
     except ImportError:
@@ -1257,6 +1267,7 @@ def animate_occupancy(
     edge_geometries: Optional[Dict[int, list]] = None,
     map_style: str = "open-street-map",
     map_zoom: Optional[int] = None,
+    map_center: Optional[tuple] = None,
     capacity: Optional[np.ndarray | int | str | float] = None,
     play_fps: int = 5,
     edge_width: float = 5.0,
@@ -1294,6 +1305,9 @@ def animate_occupancy(
         Map tile style (map mode only).
     map_zoom : int or None
         Initial zoom level (map mode only).
+    map_center : tuple or None
+        ``(lon, lat)`` for the initial map centre.  Defaults to the
+        centroid of all nodes.
     capacity : ndarray, int, float, ``"DELTA"``, or None
         Per-edge capacity.  If *None*, max observed occupancy is 100 %.
     play_fps : int
@@ -1355,7 +1369,10 @@ def animate_occupancy(
         # ----- MAP MODE -----
         lats = [pos_latlon[n][1] for n in pos_latlon]
         lons = [pos_latlon[n][0] for n in pos_latlon]
-        center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
+        if map_center is not None:
+            center_lat, center_lon = float(map_center[1]), float(map_center[0])
+        else:
+            center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
         if map_zoom is None:
             max_range = max(max(lats) - min(lats), max(lons) - min(lons))
             map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
