@@ -232,6 +232,5 @@ try:
 
 except ImportError as e:
     print(f"\nSkipping OSMnx example (missing dependency: {e})")
-    print("Install with: pip install 'fast-traffic-simulator[map]'")
 
 print(f"\nDone. All outputs in {OUT_DIR}/")

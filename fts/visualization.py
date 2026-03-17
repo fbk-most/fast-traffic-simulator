@@ -952,8 +952,7 @@ def animate_mpl(
         try:
             import contextily as cx
             src = tile_source or cx.providers.OpenStreetMap.Mapnik
-            cx.add_basemap(ax, crs=crs, source=src,
-                           requests_kwargs={"headers": {"Referer": "https://localhost"}})
+            cx.add_basemap(ax, crs=crs, source=src)
         except ImportError:
             pass  # no contextily, skip tiles
 
@@ -1867,8 +1866,7 @@ def animate_occupancy_mpl(
         try:
             import contextily as cx
             src = tile_source or cx.providers.OpenStreetMap.Mapnik
-            cx.add_basemap(ax, crs=crs, source=src,
-                           requests_kwargs={"headers": {"Referer": "https://localhost"}})
+            cx.add_basemap(ax, crs=crs, source=src)
         except ImportError:
             pass
 
