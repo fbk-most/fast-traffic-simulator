@@ -186,7 +186,14 @@ class Simulator:
                 # -1: lane exists but is empty; -2: lane does not exist for this edge
                 self.last_vehicle[:, lane] = np.where(self.lanes > lane, -1, -2)
 
-    def __init__(self, edges, vehicles, *, random: bool = False) -> None:
+    def __init__(
+        self,
+        edges,
+        vehicles,
+        *,
+        random: bool = False,
+        rng: np.random.Generator | None = None,
+    ) -> None:
         """Store edge and vehicle data without computing routes.
 
         This constructor is intentionally lightweight. Call :meth:`build`
@@ -201,8 +208,14 @@ class Simulator:
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
+            rng: NumPy random Generator to use when ``random=True``. If
+                ``None`` and ``random=True``, a fresh Generator is created via
+                ``numpy.random.default_rng()``.
         """
         self._random = random
+        self._rng: np.random.Generator | None = (
+            np.random.default_rng() if (random and rng is None) else rng
+        )
         self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
             origin=vehicles['origin'].values.astype(np.int32),
@@ -240,6 +253,7 @@ class Simulator:
         *,
         fix_unreachable: bool = False,
         random: bool = False,
+        rng: np.random.Generator | None = None,
     ) -> tuple['Simulator', list[int]]:
         """Construct a fully initialised simulator ready to run.
 
@@ -262,6 +276,10 @@ class Simulator:
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
+            rng: NumPy random Generator forwarded to the simulator when
+                ``random=True``. Pass the same Generator used for
+                replica-level stochasticity to make runs fully reproducible.
+                If ``None`` and ``random=True``, a fresh Generator is created.
 
         Returns:
             A two-tuple ``(simulator, fixed)`` where *simulator* is ready to
@@ -273,7 +291,7 @@ class Simulator:
             ValueError: If ``fix_unreachable=False`` and one or more vehicles
                 have unreachable destinations.
         """
-        simulator = cls(edges, vehicles, random=random)
+        simulator = cls(edges, vehicles, random=random, rng=rng)
 
         # Compute the routing.
         # Note that from/to are inverted so that Dijkstra returns the *successor*
@@ -440,8 +458,9 @@ class Simulator:
                 # Get unique edges targeted by the vehicles, and the corresponding vehicles.
                 # Shuffling is performed for random simulations.
                 if self._random:
+                    assert self._rng is not None
                     order = np.arange(len(next_edges))
-                    np.random.shuffle(order)
+                    self._rng.shuffle(order)
                     unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
                     unique_vehicles = order[unique_vehicles]
                 else:

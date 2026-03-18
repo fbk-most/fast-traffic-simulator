@@ -370,6 +370,11 @@ def plot_network(
     edges_df,
     pos: Optional[Dict[Hashable, tuple]] = None,
     *,
+    pos_latlon: Optional[Dict[Hashable, tuple]] = None,
+    edge_geometries: Optional[Dict[int, list]] = None,
+    map_style: str = "open-street-map",
+    map_zoom: Optional[int] = None,
+    map_center: Optional[tuple] = None,
     node_size: int = 12,
     edge_width: float = 1.8,
     edge_color: str = "#888",
@@ -382,6 +387,10 @@ def plot_network(
 ) -> go.Figure:
     """Plot the traffic network as an interactive Plotly figure.
 
+    Supports both XY-plane mode and real-map mode.  If *pos_latlon* is
+    provided the network is rendered on OpenStreetMap tiles using Plotly
+    Scattermap; otherwise an XY Scatter plot is used.
+
     Parameters
     ----------
     edges_df : DataFrame
@@ -389,19 +398,121 @@ def plot_network(
         ``lanes`` columns (same format accepted by :class:`fts.Simulator`).
     pos : dict or None
         Mapping ``{node_id: (x, y)}``.  If *None*, a spring layout is used.
+        Ignored when *pos_latlon* is given.
+    pos_latlon : dict or None
+        Mapping ``{node_id: (lon, lat)}``.  When provided, the network is
+        drawn on map tiles.
+    edge_geometries : dict or None
+        Mapping ``{edge_index: [(lon, lat), ...]}``.  Detailed polyline
+        coordinates for edges on the map (used only in map mode).
+    map_style : str
+        Plotly map style (e.g. ``"open-street-map"``, ``"carto-positron"``).
+    map_zoom : int or None
+        Map zoom level.  Auto-computed if *None*.
+    map_center : tuple or None
+        ``(lon, lat)`` centre of the map.  Auto-computed if *None*.
     node_size, edge_width, edge_color
         Visual styling for nodes and edges.
     edge_curvature, base_offset, parallel_spacing, parallel_exponent
         Control the curvature of edges and spacing between parallel edges.
+        Only used in XY mode.
     traffic_rule : ``"right"`` or ``"left"``
         Which side of the road vehicles travel on (affects curve direction).
+        Only used in XY mode.
     curve_single_edges : bool
         Whether to curve edges that have no parallel counterpart.
+        Only used in XY mode.
 
     Returns
     -------
     plotly.graph_objects.Figure
     """
+    use_map = pos_latlon is not None
+
+    # ====================================================================
+    # MAP MODE
+    # ====================================================================
+    if use_map:
+        # --- map centre & zoom ---
+        lats = [pos_latlon[n][1] for n in pos_latlon]
+        lons = [pos_latlon[n][0] for n in pos_latlon]
+        if map_center is not None:
+            center_lat, center_lon = float(map_center[1]), float(map_center[0])
+        else:
+            center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
+        if map_zoom is None:
+            max_range = max(max(lats) - min(lats), max(lons) - min(lons))
+            map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
+
+        # --- edge lines on map ---
+        edge_lats: list = []
+        edge_lons: list = []
+        mid_lat, mid_lon, mid_text_map = [], [], []
+        from_col = edges_df["from"].values.astype(int)
+        to_col = edges_df["to"].values.astype(int)
+
+        for idx in range(len(edges_df)):
+            u, v = int(from_col[idx]), int(to_col[idx])
+            if edge_geometries and idx in edge_geometries:
+                coords = edge_geometries[idx]
+                for lon, lat in coords:
+                    edge_lats.append(lat)
+                    edge_lons.append(lon)
+                edge_lats.append(None)
+                edge_lons.append(None)
+                mid_pt = coords[len(coords) // 2]
+                mid_lon.append(mid_pt[0])
+                mid_lat.append(mid_pt[1])
+            else:
+                edge_lats.extend([pos_latlon[u][1], pos_latlon[v][1], None])
+                edge_lons.extend([pos_latlon[u][0], pos_latlon[v][0], None])
+                mid_lon.append((pos_latlon[u][0] + pos_latlon[v][0]) / 2)
+                mid_lat.append((pos_latlon[u][1] + pos_latlon[v][1]) / 2)
+
+            row = edges_df.iloc[idx]
+            attrs = {c: row[c] for c in edges_df.columns if c not in ("from", "to")}
+            mid_text_map.append(_format_attrs("edge", f"{u} \u2192 {v} (idx={idx})", attrs))
+
+        edge_trace = go.Scattermap(
+            lat=edge_lats, lon=edge_lons, mode="lines",
+            line=dict(width=edge_width, color=edge_color),
+            hoverinfo="skip", showlegend=False,
+        )
+
+        edge_hover = go.Scattermap(
+            lat=mid_lat, lon=mid_lon, mode="markers",
+            marker=dict(size=10, opacity=0),
+            hovertemplate="%{text}<extra></extra>", text=mid_text_map,
+            showlegend=False,
+        )
+
+        # --- node trace ---
+        nodes = sorted(set(from_col) | set(to_col))
+        node_lats = [pos_latlon[n][1] for n in nodes]
+        node_lons = [pos_latlon[n][0] for n in nodes]
+        node_text = [f"<b>node {n}</b>" for n in nodes]
+
+        node_trace = go.Scattermap(
+            lat=node_lats, lon=node_lons, mode="markers",
+            marker=dict(size=node_size, color="black"),
+            hovertemplate="%{text}<extra></extra>", text=node_text,
+            name="nodes",
+        )
+
+        fig = go.Figure(data=[edge_trace, edge_hover, node_trace])
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            map=dict(
+                style=map_style,
+                center=dict(lat=center_lat, lon=center_lon),
+                zoom=map_zoom,
+            ),
+        )
+        return fig
+
+    # ====================================================================
+    # XY MODE
+    # ====================================================================
     if pos is None:
         pos = _auto_layout(edges_df)
 

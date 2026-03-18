@@ -190,8 +190,8 @@ try:
     fig_map.write_html(os.path.join(OUT_DIR, "map_animation.html"))
     print(f"  -> {OUT_DIR}/map_animation.html")
 
-    # Static network plot (projected coordinates)
-    fig_net_osm = plot_network(edges_osm, pos_proj)
+    # Static network plot on map tiles
+    fig_net_osm = plot_network(edges_osm, pos_latlon=pos_ll, edge_geometries=edge_geoms)
     fig_net_osm.write_html(os.path.join(OUT_DIR, "map_network.html"))
     print(f"  -> {OUT_DIR}/map_network.html")
 
