@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from collections import namedtuple
+from dataclasses import dataclass, field
 from typing import Dict, Hashable, Literal, Optional, Union, Tuple
 
 import numpy as np
@@ -208,6 +209,237 @@ def _build_edge_geometry(
 
 
 # ---------------------------------------------------------------------------
+# Rendering context — thin abstraction over Scatter vs Scattermap
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RenderCtx:
+    """Encapsulates the map-vs-XY difference for Plotly rendering.
+
+    In **map mode** traces are ``go.Scattermap(lat=Y, lon=X)``;
+    in **XY mode** they are ``go.Scatter(x=X, y=Y)``.
+    This class provides factory methods that pick the right one, so callers
+    never branch on the mode themselves.
+    """
+    use_map: bool = False
+    # Map-only fields (ignored in XY mode)
+    map_style: str = "carto-positron"
+    map_zoom: Optional[int] = None
+    center_lat: float = 0.0
+    center_lon: float = 0.0
+
+    # --- trace factories ---
+
+    def scatter(self, xs, ys, **kwargs) -> go.BaseTraceType:
+        """Create a markers/text trace with the correct coord keys."""
+        if self.use_map:
+            return go.Scattermap(lat=ys, lon=xs, **kwargs)
+        return go.Scatter(x=xs, y=ys, **kwargs)
+
+    def line(self, xs, ys, **kwargs) -> go.BaseTraceType:
+        """Create a line trace with the correct coord keys."""
+        if self.use_map:
+            return go.Scattermap(lat=ys, lon=xs, mode="lines", **kwargs)
+        return go.Scatter(x=xs, y=ys, mode="lines", **kwargs)
+
+    # --- layout helpers ---
+
+    def base_layout(self, *, margin: Optional[dict] = None) -> dict:
+        """Return kwargs for ``fig.update_layout()``."""
+        if self.use_map:
+            return dict(
+                map=dict(
+                    style=self.map_style,
+                    center=dict(lat=self.center_lat, lon=self.center_lon),
+                    zoom=self.map_zoom,
+                ),
+                margin=margin or dict(l=0, r=0, t=0, b=0),
+            )
+        return dict(
+            margin=margin or dict(l=10, r=10, t=10, b=10),
+            xaxis=dict(showgrid=False, zeroline=False, visible=True),
+            yaxis=dict(showgrid=False, zeroline=False, visible=True,
+                       scaleanchor="x", scaleratio=1),
+            plot_bgcolor="white",
+        )
+
+    def apply_axis_range(self, fig: go.Figure, pos: Dict[Hashable, tuple]) -> None:
+        """Set axis ranges (XY mode only — map mode auto-fits)."""
+        if self.use_map:
+            return
+        xs_all = [float(pos[n][0]) for n in pos]
+        ys_all = [float(pos[n][1]) for n in pos]
+        pad_x = (max(xs_all) - min(xs_all)) * 0.05 or 1.0
+        pad_y = (max(ys_all) - min(ys_all)) * 0.05 or 1.0
+        fig.update_xaxes(range=[min(xs_all) - pad_x, max(xs_all) + pad_x])
+        fig.update_yaxes(range=[min(ys_all) - pad_y, max(ys_all) + pad_y],
+                         scaleanchor="x", scaleratio=1)
+
+
+def _make_render_ctx(
+    pos_latlon: Optional[Dict[Hashable, tuple]],
+    *,
+    map_style: str = "carto-positron",
+    map_zoom: Optional[int] = None,
+    map_center: Optional[tuple] = None,
+) -> _RenderCtx:
+    """Build a ``_RenderCtx`` from the user-facing parameters."""
+    if pos_latlon is None:
+        return _RenderCtx(use_map=False)
+
+    lats = [pos_latlon[n][1] for n in pos_latlon]
+    lons = [pos_latlon[n][0] for n in pos_latlon]
+    if map_center is not None:
+        center_lat, center_lon = float(map_center[1]), float(map_center[0])
+    else:
+        center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
+    if map_zoom is None:
+        max_range = max(max(lats) - min(lats), max(lons) - min(lons))
+        map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
+
+    return _RenderCtx(
+        use_map=True,
+        map_style=map_style,
+        map_zoom=map_zoom,
+        center_lat=center_lat,
+        center_lon=center_lon,
+    )
+
+
+# Lane offset for lat/lon mode: ~3.5 m lane width at mid-latitude
+# 1° lat ≈ 111 km → 3.5 m ≈ 3.15e-5°
+_MAP_LANE_OFFSET = 0.000032
+
+
+def _resolve_pos(
+    pos: Optional[Dict[Hashable, tuple]],
+    pos_latlon: Optional[Dict[Hashable, tuple]],
+    edges_df,
+) -> Dict[Hashable, tuple]:
+    """Return the coordinate dict to use for geometry, auto-computing if needed."""
+    if pos_latlon is not None:
+        return pos_latlon
+    if pos is not None:
+        return pos
+    return _auto_layout(edges_df)
+
+
+def _resolve_geom(
+    edges_df,
+    pos: Dict[Hashable, tuple],
+    *,
+    edge_geometries: Optional[Dict[int, list]] = None,
+    edge_curvature: float = 0.22,
+    base_offset: float = 0.55,
+    parallel_spacing: float = 0.35,
+    parallel_exponent: float = 1.6,
+    traffic_rule: str = "right",
+    curve_single_edges: bool = False,
+    curve_samples: int = 48,
+) -> list[dict]:
+    """Unified geometry resolution.
+
+    When *edge_geometries* is provided (typically from :func:`from_osmnx`),
+    builds geometry dicts from those polylines.  Otherwise falls through to
+    :func:`_build_edge_geometry`.
+
+    Always populates ``lanes`` from *edges_df* so lane offsets work correctly.
+    """
+    lanes_col = edges_df["lanes"].values.astype(int) if "lanes" in edges_df.columns else None
+
+    if edge_geometries is not None:
+        length_col = edges_df["length"].values.astype(float)
+        from_col = edges_df["from"].values.astype(int)
+        to_col = edges_df["to"].values.astype(int)
+        geom = []
+        for idx in range(len(edges_df)):
+            if idx in edge_geometries:
+                coords = edge_geometries[idx]
+                xs_e = [c[0] for c in coords]
+                ys_e = [c[1] for c in coords]
+            else:
+                u, v = int(from_col[idx]), int(to_col[idx])
+                xs_e = [pos[u][0], pos[v][0]]
+                ys_e = [pos[u][1], pos[v][1]]
+            cum = _cumulative_arc(xs_e, ys_e)
+            total = float(cum[-1]) if len(cum) > 0 else 0.0
+            length_attr = float(length_col[idx]) if total > 0 else 1.0
+            lanes_val = max(1, int(lanes_col[idx])) if lanes_col is not None else 1
+            geom.append(dict(
+                xs=np.asarray(xs_e), ys=np.asarray(ys_e),
+                cum=cum, total=total, length_attr=length_attr,
+                lanes=lanes_val,
+                u=int(from_col[idx]), v=int(to_col[idx]),
+            ))
+        return geom
+
+    return _build_edge_geometry(
+        edges_df, pos,
+        edge_curvature=edge_curvature, base_offset=base_offset,
+        parallel_spacing=parallel_spacing, parallel_exponent=parallel_exponent,
+        traffic_rule=traffic_rule, curve_single_edges=curve_single_edges,
+        curve_samples=curve_samples,
+    )
+
+
+def _animation_layout(
+    fig: go.Figure,
+    n_steps: int,
+    t_offset: int,
+    play_fps: int,
+    tween: bool,
+    *,
+    use_map: bool = False,
+    step_labels: Optional[list[str]] = None,
+) -> None:
+    """Apply slider + play/pause button to a Plotly animation figure."""
+    ms = max(1, int(1000 / max(1, play_fps)))
+    trans = {"duration": ms, "easing": "linear"} if tween else {"duration": 0}
+    # Scattermap needs redraw=True; XY Scatter works with False
+    redraw = use_map
+    play_args = {
+        "fromcurrent": True,
+        "frame": {"duration": ms, "redraw": redraw},
+        "transition": trans,
+    }
+
+    if step_labels is None:
+        step_labels = [str(t_offset + t) for t in range(n_steps)]
+
+    # Slider and button Y positions differ slightly for map vs XY to
+    # avoid overlapping the map attribution.
+    slider_y = -0.02 if use_map else -0.07
+    button_y = -0.06 if use_map else -0.12
+
+    fig.update_layout(
+        margin=dict(b=90) if not use_map else dict(l=0, r=0, t=0, b=90),
+        sliders=[{
+            "active": 0, "y": slider_y, "x": 0.15, "len": 0.72,
+            "pad": {"t": 20, "b": 0},
+            "currentvalue": {"prefix": "t = ", "visible": True},
+            "steps": [
+                {"args": [[str(t)], {"mode": "immediate",
+                                     "frame": {"duration": 0, "redraw": redraw},
+                                     "transition": {"duration": 0}}],
+                 "label": step_labels[t], "method": "animate"}
+                for t in range(n_steps)
+            ],
+        }],
+        updatemenus=[{
+            "type": "buttons", "direction": "left",
+            "x": 0.02, "y": button_y, "showactive": True,
+            "buttons": [{
+                "label": "\u25b6 / \u23f8", "method": "animate",
+                "args": [None, play_args],
+                "args2": [[None], {"mode": "immediate",
+                                   "frame": {"duration": 0, "redraw": redraw},
+                                   "transition": {"duration": 0}}],
+            }],
+        }],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Vectorized position precomputation (shared by animate, animate_mpl)
 # ---------------------------------------------------------------------------
 
@@ -356,7 +588,7 @@ def _vehicle_colors_and_hover(
     od2col = {od: _PALETTES[i % len(_PALETTES)] for i, od in enumerate(unique_ods)}
     colors = [od2col[od] for od in od_pairs]
     hover = [
-        f"veh {i} | edges {o}\u2192{d}" if o >= 0 else f"veh {i}"
+        f"veh {i} | OD {o}\u2192{d}" if o >= 0 else f"veh {i}"
         for i, (o, d) in enumerate(od_pairs)
     ]
     return colors, hover
@@ -372,7 +604,7 @@ def plot_network(
     *,
     pos_latlon: Optional[Dict[Hashable, tuple]] = None,
     edge_geometries: Optional[Dict[int, list]] = None,
-    map_style: str = "open-street-map",
+    map_style: str = "carto-positron",
     map_zoom: Optional[int] = None,
     map_center: Optional[tuple] = None,
     node_size: int = 12,
@@ -403,8 +635,8 @@ def plot_network(
         Mapping ``{node_id: (lon, lat)}``.  When provided, the network is
         drawn on map tiles.
     edge_geometries : dict or None
-        Mapping ``{edge_index: [(lon, lat), ...]}``.  Detailed polyline
-        coordinates for edges on the map (used only in map mode).
+        Mapping ``{edge_index: [(x, y), ...]}``.  Detailed polyline
+        coordinates for edges (typically from :func:`from_osmnx`).
     map_style : str
         Plotly map style (e.g. ``"open-street-map"``, ``"carto-positron"``).
     map_zoom : int or None
@@ -415,109 +647,22 @@ def plot_network(
         Visual styling for nodes and edges.
     edge_curvature, base_offset, parallel_spacing, parallel_exponent
         Control the curvature of edges and spacing between parallel edges.
-        Only used in XY mode.
     traffic_rule : ``"right"`` or ``"left"``
         Which side of the road vehicles travel on (affects curve direction).
-        Only used in XY mode.
     curve_single_edges : bool
         Whether to curve edges that have no parallel counterpart.
-        Only used in XY mode.
 
     Returns
     -------
     plotly.graph_objects.Figure
     """
-    use_map = pos_latlon is not None
+    ctx = _make_render_ctx(pos_latlon, map_style=map_style,
+                           map_zoom=map_zoom, map_center=map_center)
+    coords = _resolve_pos(pos, pos_latlon, edges_df)
 
-    # ====================================================================
-    # MAP MODE
-    # ====================================================================
-    if use_map:
-        # --- map centre & zoom ---
-        lats = [pos_latlon[n][1] for n in pos_latlon]
-        lons = [pos_latlon[n][0] for n in pos_latlon]
-        if map_center is not None:
-            center_lat, center_lon = float(map_center[1]), float(map_center[0])
-        else:
-            center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
-        if map_zoom is None:
-            max_range = max(max(lats) - min(lats), max(lons) - min(lons))
-            map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
-
-        # --- edge lines on map ---
-        edge_lats: list = []
-        edge_lons: list = []
-        mid_lat, mid_lon, mid_text_map = [], [], []
-        from_col = edges_df["from"].values.astype(int)
-        to_col = edges_df["to"].values.astype(int)
-
-        for idx in range(len(edges_df)):
-            u, v = int(from_col[idx]), int(to_col[idx])
-            if edge_geometries and idx in edge_geometries:
-                coords = edge_geometries[idx]
-                for lon, lat in coords:
-                    edge_lats.append(lat)
-                    edge_lons.append(lon)
-                edge_lats.append(None)
-                edge_lons.append(None)
-                mid_pt = coords[len(coords) // 2]
-                mid_lon.append(mid_pt[0])
-                mid_lat.append(mid_pt[1])
-            else:
-                edge_lats.extend([pos_latlon[u][1], pos_latlon[v][1], None])
-                edge_lons.extend([pos_latlon[u][0], pos_latlon[v][0], None])
-                mid_lon.append((pos_latlon[u][0] + pos_latlon[v][0]) / 2)
-                mid_lat.append((pos_latlon[u][1] + pos_latlon[v][1]) / 2)
-
-            row = edges_df.iloc[idx]
-            attrs = {c: row[c] for c in edges_df.columns if c not in ("from", "to")}
-            mid_text_map.append(_format_attrs("edge", f"{u} \u2192 {v} (idx={idx})", attrs))
-
-        edge_trace = go.Scattermap(
-            lat=edge_lats, lon=edge_lons, mode="lines",
-            line=dict(width=edge_width, color=edge_color),
-            hoverinfo="skip", showlegend=False,
-        )
-
-        edge_hover = go.Scattermap(
-            lat=mid_lat, lon=mid_lon, mode="markers",
-            marker=dict(size=10, opacity=0),
-            hovertemplate="%{text}<extra></extra>", text=mid_text_map,
-            showlegend=False,
-        )
-
-        # --- node trace ---
-        nodes = sorted(set(from_col) | set(to_col))
-        node_lats = [pos_latlon[n][1] for n in nodes]
-        node_lons = [pos_latlon[n][0] for n in nodes]
-        node_text = [f"<b>node {n}</b>" for n in nodes]
-
-        node_trace = go.Scattermap(
-            lat=node_lats, lon=node_lons, mode="markers",
-            marker=dict(size=node_size, color="black"),
-            hovertemplate="%{text}<extra></extra>", text=node_text,
-            name="nodes",
-        )
-
-        fig = go.Figure(data=[edge_trace, edge_hover, node_trace])
-        fig.update_layout(
-            margin=dict(l=0, r=0, t=0, b=0),
-            map=dict(
-                style=map_style,
-                center=dict(lat=center_lat, lon=center_lon),
-                zoom=map_zoom,
-            ),
-        )
-        return fig
-
-    # ====================================================================
-    # XY MODE
-    # ====================================================================
-    if pos is None:
-        pos = _auto_layout(edges_df)
-
-    geom = _build_edge_geometry(
-        edges_df, pos,
+    geom = _resolve_geom(
+        edges_df, coords,
+        edge_geometries=edge_geometries,
         edge_curvature=edge_curvature, base_offset=base_offset,
         parallel_spacing=parallel_spacing, parallel_exponent=parallel_exponent,
         traffic_rule=traffic_rule, curve_single_edges=curve_single_edges,
@@ -542,41 +687,34 @@ def plot_network(
         attrs = {c: row[c] for c in edges_df.columns if c not in ("from", "to")}
         mid_text.append(_format_attrs("edge", f"{g['u']} \u2192 {g['v']} (idx={idx})", attrs))
 
-    edge_trace = go.Scatter(
-        x=all_ex, y=all_ey, mode="lines",
+    edge_trace = ctx.line(
+        all_ex, all_ey,
         line=dict(width=edge_width, color=edge_color),
         hoverinfo="skip", showlegend=False,
     )
 
-    edge_hover = go.Scatter(
-        x=mid_x, y=mid_y, mode="markers",
+    edge_hover = ctx.scatter(
+        mid_x, mid_y, mode="markers",
         marker=dict(size=10, opacity=0),
         hovertemplate="%{text}<extra></extra>", text=mid_text,
         showlegend=False,
-        hoverlabel=dict(bgcolor="white", font=dict(color="black")),
     )
 
     # --- node trace ---
     nodes = sorted(set(edges_df["from"].astype(int)) | set(edges_df["to"].astype(int)))
-    xN = [float(pos[n][0]) for n in nodes]
-    yN = [float(pos[n][1]) for n in nodes]
+    xN = [float(coords[n][0]) for n in nodes]
+    yN = [float(coords[n][1]) for n in nodes]
     node_text = [f"<b>node {n}</b>" for n in nodes]
 
-    node_trace = go.Scatter(
-        x=xN, y=yN, mode="markers",
+    node_trace = ctx.scatter(
+        xN, yN, mode="markers",
         marker=dict(size=node_size, color="black"),
         hovertemplate="%{text}<extra></extra>", text=node_text,
         name="nodes",
     )
 
     fig = go.Figure(data=[edge_trace, edge_hover, node_trace])
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=10, b=10),
-        xaxis=dict(showgrid=False, zeroline=False, visible=True),
-        yaxis=dict(showgrid=False, zeroline=False, visible=True,
-                   scaleanchor="x", scaleratio=1),
-        plot_bgcolor="white",
-    )
+    fig.update_layout(**ctx.base_layout())
     return fig
 
 
@@ -591,7 +729,7 @@ def animate(
     *,
     pos_latlon: Optional[Dict[Hashable, tuple]] = None,
     edge_geometries: Optional[Dict[int, list]] = None,
-    map_style: str = "open-street-map",
+    map_style: str = "carto-positron",
     map_zoom: Optional[int] = None,
     map_center: Optional[tuple] = None,
     play_fps: int = 5,
@@ -632,8 +770,7 @@ def animate(
     pos_latlon : dict or None
         ``{node_id: (lon, lat)}`` in EPSG:4326 for map mode.
     edge_geometries : dict or None
-        ``{edge_idx: [(lon, lat), ...]}`` from :func:`from_osmnx`.
-        Used in map mode; ignored in XY mode.
+        ``{edge_idx: [(x, y), ...]}`` from :func:`from_osmnx`.
     map_style : str
         Map tile style for map mode.
     map_zoom : int or None
@@ -646,7 +783,8 @@ def animate(
     marker_size : int
         Vehicle marker diameter.
     lane_offset : float
-        Lateral offset per lane (XY mode only).
+        Lateral offset per lane (XY mode).  In map mode an appropriate
+        offset in degrees is used automatically.
     tween : bool
         Smooth interpolation between frames.
     t_start : int or None
@@ -654,7 +792,7 @@ def animate(
     t_end : int or None
         One past the last timestep to include (default: all steps).
     lane_logs : ndarray or None
-        Per-step lane index (XY mode only).
+        Per-step lane index for each vehicle.
     vehicle_colors : dict or None
         ``{vehicle_id: color_string}``.
     vehicle_ids : list of int or None
@@ -662,16 +800,18 @@ def animate(
     edge_color : str
         Edge line colour.
     edge_width : float
-        Edge line width (map mode).
+        Edge line width.
     edge_curvature, base_offset, parallel_spacing, parallel_exponent,
     traffic_rule, curve_single_edges
-        Edge geometry parameters (XY mode only).
+        Edge geometry parameters.
 
     Returns
     -------
     plotly.graph_objects.Figure
     """
-    use_map = pos_latlon is not None
+    ctx = _make_render_ctx(pos_latlon, map_style=map_style,
+                           map_zoom=map_zoom, map_center=map_center)
+    coords = _resolve_pos(pos, pos_latlon, edges_df)
 
     if logs.ndim != 3 or logs.shape[2] != 2:
         raise ValueError(
@@ -702,147 +842,12 @@ def animate(
 
     n_steps, n_veh, _ = logs.shape
 
-    # ====================================================================
-    # MAP MODE
-    # ====================================================================
-    if use_map:
-        # --- map centre & zoom ---
-        lats = [pos_latlon[n][1] for n in pos_latlon]
-        lons = [pos_latlon[n][0] for n in pos_latlon]
-        if map_center is not None:
-            center_lat, center_lon = float(map_center[1]), float(map_center[0])
-        else:
-            center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
-        if map_zoom is None:
-            max_range = max(max(lats) - min(lats), max(lons) - min(lons))
-            map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
-
-        # --- edge lines on map ---
-        edge_lats: list = []
-        edge_lons: list = []
-        from_col = edges_df["from"].values.astype(int)
-        to_col = edges_df["to"].values.astype(int)
-        if edge_geometries:
-            for idx in range(len(edges_df)):
-                coords = edge_geometries.get(idx)
-                if coords:
-                    for lon, lat in coords:
-                        edge_lats.append(lat)
-                        edge_lons.append(lon)
-                    edge_lats.append(None)
-                    edge_lons.append(None)
-        else:
-            for idx in range(len(edges_df)):
-                u, v = int(from_col[idx]), int(to_col[idx])
-                edge_lats.extend([pos_latlon[u][1], pos_latlon[v][1], None])
-                edge_lons.extend([pos_latlon[u][0], pos_latlon[v][0], None])
-
-        edge_trace = go.Scattermap(
-            lat=edge_lats, lon=edge_lons, mode="lines",
-            line=dict(width=edge_width, color=edge_color),
-            hoverinfo="skip", showlegend=False,
-        )
-        fig = go.Figure(data=[edge_trace])
-
-        if n_veh == 0:
-            fig.update_layout(
-                map=dict(style=map_style, center=dict(lat=center_lat, lon=center_lon), zoom=map_zoom),
-            )
-            fig.frames = []
-            return fig
-
-        # --- build per-edge lat/lon polyline geometry for interpolation ---
-        length_col = edges_df["length"].values.astype(float)
-        map_geom = []
-        for idx in range(len(edges_df)):
-            if edge_geometries and idx in edge_geometries:
-                coords = edge_geometries[idx]
-                lons_e = [c[0] for c in coords]
-                lats_e = [c[1] for c in coords]
-            else:
-                u, v = int(from_col[idx]), int(to_col[idx])
-                lons_e = [pos_latlon[u][0], pos_latlon[v][0]]
-                lats_e = [pos_latlon[u][1], pos_latlon[v][1]]
-            cum = _cumulative_arc(lons_e, lats_e)
-            total = float(cum[-1]) if len(cum) > 0 else 0.0
-            length_attr = float(length_col[idx]) if total > 0 else 1.0
-            map_geom.append(dict(
-                xs=np.asarray(lons_e), ys=np.asarray(lats_e),
-                cum=cum, total=total, length_attr=length_attr,
-                lanes=1, u=0, v=0,
-            ))
-
-        X, Y, OP = _precompute_positions(logs, map_geom)
-        colors, hover = _vehicle_colors_and_hover(logs, n_veh, vehicle_colors)
-        if orig_ids is not None:
-            hover = [h.replace(f"veh {i}", f"veh {orig_ids[i]}") for i, h in enumerate(hover)]
-        hover_arr = np.array(hover, dtype=object)
-
-        text0 = np.where(OP[0] > 0, hover_arr, "")
-        fig.add_trace(go.Scattermap(
-            lat=Y[0], lon=X[0], mode="markers",
-            marker=dict(size=marker_size, color=colors, opacity=OP[0]),
-            hovertemplate="%{text}<extra></extra>", text=text0,
-            showlegend=False,
-        ))
-        veh_idx = len(fig.data) - 1
-
-        frames = []
-        for t in range(n_steps):
-            text_t = np.where(OP[t] > 0, hover_arr, "")
-            frames.append(go.Frame(
-                name=str(t),
-                data=[go.Scattermap(lat=Y[t], lon=X[t], marker=dict(opacity=OP[t]), text=text_t)],
-                traces=[veh_idx],
-            ))
-        fig.frames = frames
-
-        fig.update_layout(
-            map=dict(style=map_style, center=dict(lat=center_lat, lon=center_lon), zoom=map_zoom),
-            margin=dict(l=0, r=0, t=0, b=90),
-        )
-
-        ms = max(1, int(1000 / max(1, play_fps)))
-        trans = {"duration": ms, "easing": "linear"} if tween else {"duration": 0}
-        play_args = {"fromcurrent": True,
-                     "frame": {"duration": ms, "redraw": True},
-                     "transition": trans}
-
-        fig.update_layout(
-            sliders=[{
-                "active": 0, "y": -0.02, "x": 0.15, "len": 0.72,
-                "pad": {"t": 20, "b": 0},
-                "currentvalue": {"prefix": "t = ", "visible": True},
-                "steps": [
-                    {"args": [[str(t)], {"mode": "immediate",
-                                         "frame": {"duration": 0, "redraw": True},
-                                         "transition": {"duration": 0}}],
-                     "label": str(t_offset + t), "method": "animate"}
-                    for t in range(n_steps)
-                ],
-            }],
-            updatemenus=[{
-                "type": "buttons", "direction": "left",
-                "x": 0.02, "y": -0.06, "showactive": True,
-                "buttons": [{
-                    "label": "\u25b6 / \u23f8", "method": "animate",
-                    "args": [None, play_args],
-                    "args2": [[None], {"mode": "immediate",
-                                       "frame": {"duration": 0, "redraw": True},
-                                       "transition": {"duration": 0}}],
-                }],
-            }],
-        )
-        return fig
-
-    # ====================================================================
-    # XY MODE
-    # ====================================================================
-    if pos is None:
-        pos = _auto_layout(edges_df)
-
+    # --- base figure with edge lines ---
     base_fig = plot_network(
-        edges_df, pos,
+        edges_df, pos, pos_latlon=pos_latlon,
+        edge_geometries=edge_geometries,
+        map_style=map_style, map_zoom=map_zoom, map_center=map_center,
+        edge_color=edge_color, edge_width=edge_width,
         edge_curvature=edge_curvature, base_offset=base_offset,
         parallel_spacing=parallel_spacing, parallel_exponent=parallel_exponent,
         traffic_rule=traffic_rule, curve_single_edges=curve_single_edges,
@@ -853,31 +858,37 @@ def animate(
         fig.frames = []
         return fig
 
-    geom = _build_edge_geometry(
-        edges_df, pos,
+    # --- geometry + position precomputation ---
+    geom = _resolve_geom(
+        edges_df, coords,
+        edge_geometries=edge_geometries,
         edge_curvature=edge_curvature, base_offset=base_offset,
         parallel_spacing=parallel_spacing, parallel_exponent=parallel_exponent,
         traffic_rule=traffic_rule, curve_single_edges=curve_single_edges,
         curve_samples=48,
     )
 
+    effective_lane_offset = _MAP_LANE_OFFSET if ctx.use_map else lane_offset
+    X, Y, OP = _precompute_positions(
+        logs, geom,
+        lane_logs=lane_logs, lane_offset=effective_lane_offset,
+        traffic_rule=traffic_rule,
+    )
+
     colors, hover = _vehicle_colors_and_hover(logs, n_veh, vehicle_colors)
     if orig_ids is not None:
         hover = [h.replace(f"veh {i}", f"veh {orig_ids[i]}") for i, h in enumerate(hover)]
-
-    X, Y, OP = _precompute_positions(
-        logs, geom,
-        lane_logs=lane_logs, lane_offset=lane_offset, traffic_rule=traffic_rule,
-    )
-
     hover_arr = np.array(hover, dtype=object)
 
+    # --- vehicle trace + frames ---
+    marker_kw: dict = dict(size=marker_size, color=colors, opacity=OP[0])
+    if not ctx.use_map:
+        marker_kw.update(symbol="circle", line=dict(color="black", width=1))
+
     text0 = np.where(OP[0] > 0, hover_arr, "")
-    fig.add_trace(go.Scatter(
-        x=X[0], y=Y[0], mode="markers",
-        marker=dict(size=marker_size, symbol="circle",
-                    line=dict(color="black", width=1),
-                    color=colors, opacity=OP[0]),
+    fig.add_trace(ctx.scatter(
+        X[0], Y[0], mode="markers",
+        marker=marker_kw,
         hovertemplate="%{text}<extra></extra>", text=text0,
         showlegend=False,
     ))
@@ -888,50 +899,18 @@ def animate(
         text_t = np.where(OP[t] > 0, hover_arr, "")
         frames.append(go.Frame(
             name=str(t),
-            data=[go.Scatter(x=X[t], y=Y[t], marker=dict(opacity=OP[t]), text=text_t)],
+            data=[ctx.scatter(
+                X[t], Y[t],
+                marker=dict(opacity=OP[t]), text=text_t,
+            )],
             traces=[veh_idx],
         ))
     fig.frames = frames
 
-    xs_all = [float(pos[n][0]) for n in pos]
-    ys_all = [float(pos[n][1]) for n in pos]
-    pad_x = (max(xs_all) - min(xs_all)) * 0.05 or 1.0
-    pad_y = (max(ys_all) - min(ys_all)) * 0.05 or 1.0
-    fig.update_xaxes(range=[min(xs_all) - pad_x, max(xs_all) + pad_x])
-    fig.update_yaxes(range=[min(ys_all) - pad_y, max(ys_all) + pad_y],
-                     scaleanchor="x", scaleratio=1)
-
-    ms = max(1, int(1000 / max(1, play_fps)))
-    trans = {"duration": ms, "easing": "linear"} if tween else {"duration": 0}
-    play_args = {"fromcurrent": True, "frame": {"duration": ms, "redraw": False},
-                 "transition": trans}
-
-    fig.update_layout(
-        margin=dict(b=90),
-        sliders=[{
-            "active": 0, "y": -0.07, "x": 0.15, "len": 0.72,
-            "pad": {"t": 20, "b": 0},
-            "currentvalue": {"prefix": "t = ", "visible": True},
-            "steps": [
-                {"args": [[str(t)], {"mode": "immediate",
-                                     "frame": {"duration": 0, "redraw": False},
-                                     "transition": {"duration": 0}}],
-                 "label": str(t_offset + t), "method": "animate"}
-                for t in range(n_steps)
-            ],
-        }],
-        updatemenus=[{
-            "type": "buttons", "direction": "left",
-            "x": 0.02, "y": -0.12, "showactive": True,
-            "buttons": [{
-                "label": "\u25b6 / \u23f8", "method": "animate",
-                "args": [None, play_args],
-                "args2": [[None], {"mode": "immediate",
-                                   "frame": {"duration": 0, "redraw": False},
-                                   "transition": {"duration": 0}}],
-            }],
-        }],
-    )
+    # --- layout + animation controls ---
+    ctx.apply_axis_range(fig, coords)
+    _animation_layout(fig, n_steps, t_offset, play_fps, tween,
+                       use_map=ctx.use_map)
 
     return fig
 
@@ -1276,7 +1255,7 @@ def animate_map(
     edge_geometries: Optional[Dict[int, list]] = None,
     edge_color: str = "rgba(50,50,50,0.5)",
     edge_width: float = 2.0,
-    map_style: str = "open-street-map",
+    map_style: str = "carto-positron",
     map_zoom: Optional[int] = None,
     tween: bool = True,
 ) -> go.Figure:
@@ -1318,6 +1297,50 @@ def _compute_occupancy(logs: np.ndarray, n_edges: int) -> np.ndarray:
     return occupancy
 
 
+def compute_edge_capacity(edges_df, delta: float) -> np.ndarray:
+    """Compute per-edge vehicle capacity from edge geometry.
+
+    Parameters
+    ----------
+    edges_df : DataFrame
+        Edges table with ``length`` and ``lanes`` columns.
+    delta : float
+        Minimum safe following distance (metres).
+
+    Returns
+    -------
+    ndarray of shape ``(n_edges,)``
+        Maximum number of vehicles that fit on each edge.
+    """
+    L = edges_df["length"].values.astype(float)
+    lanes = edges_df["lanes"].values.astype(int)
+    nmax_lane = np.floor(L / delta).astype(int) + 1
+    return np.maximum(1, lanes * nmax_lane)
+
+
+def compute_occupancy(logs: np.ndarray, edges_df, delta: float) -> np.ndarray:
+    """Compute per-edge occupancy ratio at each timestep.
+
+    Parameters
+    ----------
+    logs : ndarray of shape ``(steps, n_vehicles, 2)``
+        Position log (edge index + distance) as produced by a simulation loop.
+    edges_df : DataFrame
+        Edges table with ``length`` and ``lanes`` columns.
+    delta : float
+        Minimum safe following distance (metres) used in the simulation.
+
+    Returns
+    -------
+    ndarray of shape ``(n_steps, n_edges)``
+        Occupancy ratio in [0, 1] for each edge at each timestep.
+    """
+    n_edges = len(edges_df)
+    counts = _compute_occupancy(logs, n_edges)
+    cap = compute_edge_capacity(edges_df, delta).astype(float)
+    return np.clip(counts / cap[np.newaxis, :], 0.0, 1.0)
+
+
 def _occupancy_rgb(ratio: float) -> str:
     """Map ratio [0, 1] to green → yellow → red colour string."""
     r = max(0.0, min(1.0, ratio))
@@ -1344,42 +1367,20 @@ def _edge_segments_from_geom(geom: list[dict]) -> list[tuple[list, list]]:
     return segs
 
 
-def _resolve_capacity(capacity, occupancy: np.ndarray, edges_df, n_edges: int) -> np.ndarray:
-    """Resolve capacity parameter into a per-edge float array."""
-    if capacity is None:
-        cap = occupancy.max(axis=0).astype(float)
-        cap = np.where(cap > 0, cap, 1.0)
-    elif capacity == "DELTA":
-        from fts import Simulator as _Simulator
-        delta = float(_Simulator.DELTA)
-        L = edges_df["length"].values.astype(float)
-        lanes = edges_df["lanes"].values.astype(int)
-        nmax_lane = np.floor(L / delta).astype(int) + 1
-        nmax = np.maximum(1, lanes * nmax_lane)
-        cap = nmax.astype(float)
-    elif np.isscalar(capacity):
-        cap = np.full(n_edges, float(capacity))
-    else:
-        cap = np.asarray(capacity, dtype=float)
-        cap = np.where(cap > 0, cap, 1.0)
-    return cap
-
-
 # ---------------------------------------------------------------------------
 # animate_occupancy (Plotly, unified: XY + map)
 # ---------------------------------------------------------------------------
 
 def animate_occupancy(
     edges_df,
-    logs: np.ndarray,
+    occupancy: np.ndarray,
     pos: Optional[Dict[Hashable, tuple]] = None,
     *,
     pos_latlon: Optional[Dict[Hashable, tuple]] = None,
     edge_geometries: Optional[Dict[int, list]] = None,
-    map_style: str = "open-street-map",
+    map_style: str = "carto-positron",
     map_zoom: Optional[int] = None,
     map_center: Optional[tuple] = None,
-    capacity: Optional[np.ndarray | int | str | float] = None,
     play_fps: int = 5,
     edge_width: float = 5.0,
     tween: bool = True,
@@ -1403,24 +1404,22 @@ def animate_occupancy(
     ----------
     edges_df : DataFrame
         Edges table.
-    logs : ndarray of shape ``(steps, n_vehicles, 2)``
-        Position log.
+    occupancy : ndarray of shape ``(n_steps, n_edges)``
+        Pre-computed occupancy ratios in [0, 1] (e.g. from
+        :func:`compute_occupancy`).
     pos : dict or None
         Node positions for XY mode.  Auto-computed if *None*.
     pos_latlon : dict or None
         ``{node_id: (lon, lat)}`` in EPSG:4326 for map mode.
     edge_geometries : dict or None
-        ``{edge_idx: [(lon, lat), ...]}`` from :func:`from_osmnx`.
-        Used in map mode; ignored in XY mode.
+        ``{edge_idx: [(x, y), ...]}`` from :func:`from_osmnx`.
     map_style : str
-        Map tile style (map mode only).
+        Map tile style.
     map_zoom : int or None
-        Initial zoom level (map mode only).
+        Initial zoom level.  Auto-computed if *None*.
     map_center : tuple or None
         ``(lon, lat)`` for the initial map centre.  Defaults to the
         centroid of all nodes.
-    capacity : ndarray, int, float, ``"DELTA"``, or None
-        Per-edge capacity.  If *None*, max observed occupancy is 100 %.
     play_fps : int
         Playback frames per second.
     edge_width : float
@@ -1431,28 +1430,29 @@ def animate_occupancy(
         Maximum animation frames (subsampled if exceeded).
     edge_curvature, base_offset, parallel_spacing, parallel_exponent,
     traffic_rule, curve_single_edges
-        Edge geometry parameters (XY mode only).
+        Edge geometry parameters.
 
     Returns
     -------
     plotly.graph_objects.Figure
     """
-    use_map = pos_latlon is not None
+    ctx = _make_render_ctx(pos_latlon, map_style=map_style,
+                           map_zoom=map_zoom, map_center=map_center)
+    coords = _resolve_pos(pos, pos_latlon, edges_df)
 
-    if logs.ndim != 3 or logs.shape[2] != 2:
-        raise ValueError(f"logs must have shape (steps, n_vehicles, 2), got {logs.shape}")
+    if occupancy.ndim != 2:
+        raise ValueError(f"occupancy must have shape (n_steps, n_edges), got {occupancy.shape}")
 
     # --- time range slicing ---
     _t0 = t_start if t_start is not None else 0
-    _t1 = t_end if t_end is not None else logs.shape[0]
+    _t1 = t_end if t_end is not None else occupancy.shape[0]
     t_offset = _t0
-    logs = logs[_t0:_t1]
+    occupancy = occupancy[_t0:_t1]
 
-    n_steps_raw = logs.shape[0]
+    n_steps_raw = occupancy.shape[0]
     n_edges = len(edges_df)
 
-    # --- occupancy + subsample ---
-    occupancy = _compute_occupancy(logs, n_edges)
+    # --- subsample ---
     if n_steps_raw > max_frames:
         step_indices = np.linspace(0, n_steps_raw - 1, max_frames, dtype=int)
         occupancy = occupancy[step_indices]
@@ -1460,167 +1460,19 @@ def animate_occupancy(
         step_indices = np.arange(n_steps_raw)
     n_steps = len(step_indices)
 
-    cap = _resolve_capacity(capacity, occupancy, edges_df, n_edges)
     from_col = edges_df["from"].values.astype(int)
     to_col = edges_df["to"].values.astype(int)
 
     # --- per-edge colour at each timestep (precompute) ---
-    # ratios shape: (n_steps, n_edges)
-    ratios_all = np.clip(occupancy / cap[np.newaxis, :], 0.0, 1.0)
+    ratios_all = np.clip(occupancy, 0.0, 1.0)
 
     def _edge_color(ratio: float) -> str:
         return _occupancy_rgb(ratio)
 
-    # Use per-edge traces: each edge gets a fixed-geometry trace.
-    # Frames only update line.color — no coordinate interpolation, no jumpiness.
-    # For very large networks (>500 edges), fall back to bin grouping with tween off.
-    use_per_edge = n_edges <= 500
-
-    if use_map:
-        # ----- MAP MODE -----
-        lats = [pos_latlon[n][1] for n in pos_latlon]
-        lons = [pos_latlon[n][0] for n in pos_latlon]
-        if map_center is not None:
-            center_lat, center_lon = float(map_center[1]), float(map_center[0])
-        else:
-            center_lat, center_lon = float(np.mean(lats)), float(np.mean(lons))
-        if map_zoom is None:
-            max_range = max(max(lats) - min(lats), max(lons) - min(lons))
-            map_zoom = int(np.clip(14 - np.log2(max_range / 0.01 + 1), 10, 18))
-
-        # Pre-compute per-edge lat/lon segments
-        edge_segs_lat: list[list] = []
-        edge_segs_lon: list[list] = []
-        for idx in range(n_edges):
-            if edge_geometries and idx in edge_geometries:
-                coords = edge_geometries[idx]
-                lons_e = [c[0] for c in coords]
-                lats_e = [c[1] for c in coords]
-            else:
-                u, v = int(from_col[idx]), int(to_col[idx])
-                lons_e = [pos_latlon[u][0], pos_latlon[v][0]]
-                lats_e = [pos_latlon[u][1], pos_latlon[v][1]]
-            edge_segs_lon.append(lons_e)
-            edge_segs_lat.append(lats_e)
-
-        # Background edges
-        bg_lat: list = []
-        bg_lon: list = []
-        for slat, slon in zip(edge_segs_lat, edge_segs_lon):
-            bg_lat.extend(slat + [None])
-            bg_lon.extend(slon + [None])
-
-        fig = go.Figure(data=[go.Scattermap(
-            lat=bg_lat, lon=bg_lon, mode="lines",
-            line=dict(width=max(1.0, edge_width * 0.4), color="rgba(200,200,200,0.5)"),
-            hoverinfo="skip", showlegend=False,
-        )])
-
-        if use_per_edge:
-            # One trace per edge — frames only change colour
-            edge_start = len(fig.data)
-            for ei in range(n_edges):
-                fig.add_trace(go.Scattermap(
-                    lat=edge_segs_lat[ei], lon=edge_segs_lon[ei], mode="lines",
-                    line=dict(width=edge_width, color=_edge_color(ratios_all[0, ei])),
-                    hoverinfo="skip", showlegend=False,
-                ))
-            edge_indices = list(range(edge_start, edge_start + n_edges))
-
-            frames = []
-            for t in range(n_steps):
-                frame_data = [
-                    go.Scattermap(
-                        lat=edge_segs_lat[ei], lon=edge_segs_lon[ei],
-                        mode="lines",
-                        line=dict(width=edge_width, color=_edge_color(ratios_all[t, ei])),
-                        hoverinfo="skip", showlegend=False,
-                    )
-                    for ei in range(n_edges)
-                ]
-                frames.append(go.Frame(name=str(t), data=frame_data, traces=edge_indices))
-            fig.frames = frames
-        else:
-            # Bin grouping fallback for large networks — force tween off
-            tween = False
-            bin_colors = _bin_colors()
-
-            def _bin_traces_map(t: int):
-                bins = np.clip(
-                    (ratios_all[t] * _N_OCC_BINS).astype(int), 0, _N_OCC_BINS - 1
-                )
-                traces = []
-                for b in range(_N_OCC_BINS):
-                    lat_all: list = []
-                    lon_all: list = []
-                    for ei in np.where(bins == b)[0]:
-                        lat_all.extend(edge_segs_lat[ei] + [None])
-                        lon_all.extend(edge_segs_lon[ei] + [None])
-                    traces.append(go.Scattermap(
-                        lat=lat_all or [None], lon=lon_all or [None],
-                        mode="lines",
-                        line=dict(width=edge_width, color=bin_colors[b]),
-                        hoverinfo="skip", showlegend=False,
-                    ))
-                return traces
-
-            initial_traces = _bin_traces_map(0)
-            bin_start = len(fig.data)
-            for tr in initial_traces:
-                fig.add_trace(tr)
-            bin_indices_list = list(range(bin_start, bin_start + _N_OCC_BINS))
-
-            frames = []
-            for t in range(n_steps):
-                frames.append(go.Frame(
-                    name=str(t), data=_bin_traces_map(t), traces=bin_indices_list,
-                ))
-            fig.frames = frames
-
-        fig.update_layout(
-            map=dict(style=map_style, center=dict(lat=center_lat, lon=center_lon), zoom=map_zoom),
-            margin=dict(l=0, r=0, t=0, b=90),
-        )
-
-        ms = max(1, int(1000 / max(1, play_fps)))
-        trans = {"duration": ms, "easing": "linear"} if tween else {"duration": 0}
-        play_args = {"fromcurrent": True, "frame": {"duration": ms, "redraw": True},
-                     "transition": trans}
-        fig.update_layout(
-            sliders=[{
-                "active": 0, "y": -0.02, "x": 0.15, "len": 0.72,
-                "pad": {"t": 20, "b": 0},
-                "currentvalue": {"prefix": "t = ", "visible": True},
-                "steps": [
-                    {"args": [[str(t)], {"mode": "immediate",
-                                         "frame": {"duration": 0, "redraw": True},
-                                         "transition": {"duration": 0}}],
-                     "label": str(t_offset + t), "method": "animate"}
-                    for t in range(n_steps)
-                ],
-            }],
-            updatemenus=[{
-                "type": "buttons", "direction": "left",
-                "x": 0.02, "y": -0.06, "showactive": True,
-                "buttons": [{
-                    "label": "\u25b6 / \u23f8", "method": "animate",
-                    "args": [None, play_args],
-                    "args2": [[None], {"mode": "immediate",
-                                       "frame": {"duration": 0, "redraw": True},
-                                       "transition": {"duration": 0}}],
-                }],
-            }],
-        )
-        return fig
-
-    # ====================================================================
-    # XY MODE
-    # ====================================================================
-    if pos is None:
-        pos = _auto_layout(edges_df)
-
-    geom = _build_edge_geometry(
-        edges_df, pos,
+    # --- edge geometry ---
+    geom = _resolve_geom(
+        edges_df, coords,
+        edge_geometries=edge_geometries,
         edge_curvature=edge_curvature, base_offset=base_offset,
         parallel_spacing=parallel_spacing, parallel_exponent=parallel_exponent,
         traffic_rule=traffic_rule, curve_single_edges=curve_single_edges,
@@ -1628,37 +1480,43 @@ def animate_occupancy(
     )
     segs = _edge_segments_from_geom(geom)
 
-    # Node trace
-    nodes = sorted(set(edges_df["from"].astype(int)) | set(edges_df["to"].astype(int)))
-    xN = [float(pos[n][0]) for n in nodes]
-    yN = [float(pos[n][1]) for n in nodes]
-    node_trace = go.Scatter(
-        x=xN, y=yN, mode="markers",
-        marker=dict(size=8, color="black"),
-        hoverinfo="skip", showlegend=False,
-    )
-    fig = go.Figure(data=[node_trace])
+    # --- base figure: nodes + background edges ---
+    if not ctx.use_map:
+        nodes = sorted(set(edges_df["from"].astype(int)) | set(edges_df["to"].astype(int)))
+        xN = [float(coords[n][0]) for n in nodes]
+        yN = [float(coords[n][1]) for n in nodes]
+        node_trace = ctx.scatter(
+            xN, yN, mode="markers",
+            marker=dict(size=8, color="black"),
+            hoverinfo="skip", showlegend=False,
+        )
+        fig = go.Figure(data=[node_trace])
+    else:
+        fig = go.Figure()
 
-    # Background edges
     bg_x: list = []
     bg_y: list = []
     for sx, sy in segs:
         bg_x.extend(sx)
         bg_y.extend(sy)
-    fig.add_trace(go.Scatter(
-        x=bg_x, y=bg_y, mode="lines",
+    fig.add_trace(ctx.line(
+        bg_x, bg_y,
         line=dict(width=max(1.0, edge_width * 0.4), color="rgba(200,200,200,0.5)"),
         hoverinfo="skip", showlegend=False,
     ))
 
+    # Use per-edge traces: each edge gets a fixed-geometry trace.
+    # Frames only update line.color — no coordinate interpolation, no jumpiness.
+    # For very large networks (>500 edges), fall back to bin grouping with tween off.
+    use_per_edge = n_edges <= 500
+
     if use_per_edge:
-        # One trace per edge — frames only change colour (no jumpiness)
         edge_start = len(fig.data)
         for ei in range(n_edges):
             xs_e = geom[ei]["xs"].tolist()
             ys_e = geom[ei]["ys"].tolist()
-            fig.add_trace(go.Scatter(
-                x=xs_e, y=ys_e, mode="lines",
+            fig.add_trace(ctx.line(
+                xs_e, ys_e,
                 line=dict(width=edge_width, color=_edge_color(ratios_all[0, ei])),
                 hoverinfo="skip", showlegend=False,
             ))
@@ -1668,16 +1526,15 @@ def animate_occupancy(
         mid_x = [float(geom[i]["xs"][len(geom[i]["xs"]) // 2]) for i in range(n_edges)]
         mid_y = [float(geom[i]["ys"][len(geom[i]["ys"]) // 2]) for i in range(n_edges)]
         hover_text_0 = [
-            f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[0, i]}"
+            f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[0, i]:.0%}"
             for i in range(n_edges)
         ]
-        hover_trace = go.Scatter(
-            x=mid_x, y=mid_y, mode="markers",
+        fig.add_trace(ctx.scatter(
+            mid_x, mid_y, mode="markers",
             marker=dict(size=12, opacity=0),
             hovertemplate="%{text}<extra></extra>", text=hover_text_0,
             showlegend=False,
-        )
-        fig.add_trace(hover_trace)
+        ))
         hover_idx = len(fig.data) - 1
 
         frames = []
@@ -1686,16 +1543,16 @@ def animate_occupancy(
             for ei in range(n_edges):
                 xs_e = geom[ei]["xs"].tolist()
                 ys_e = geom[ei]["ys"].tolist()
-                frame_data.append(go.Scatter(
-                    x=xs_e, y=ys_e, mode="lines",
+                frame_data.append(ctx.line(
+                    xs_e, ys_e,
                     line=dict(width=edge_width, color=_edge_color(ratios_all[t, ei])),
                     hoverinfo="skip", showlegend=False,
                 ))
             hover_t = [
-                f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[t, i]}"
+                f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[t, i]:.0%}"
                 for i in range(n_edges)
             ]
-            frame_data.append(go.Scatter(text=hover_t))
+            frame_data.append(ctx.scatter([], [], text=hover_t))
             frames.append(go.Frame(
                 name=str(t), data=frame_data,
                 traces=edge_trace_indices + [hover_idx],
@@ -1717,9 +1574,8 @@ def animate_occupancy(
                 for ei in np.where(bins == b)[0]:
                     xs_all.extend(segs[ei][0])
                     ys_all.extend(segs[ei][1])
-                traces.append(go.Scatter(
-                    x=xs_all or [None], y=ys_all or [None],
-                    mode="lines",
+                traces.append(ctx.line(
+                    xs_all or [None], ys_all or [None],
                     line=dict(width=edge_width, color=bin_colors[b]),
                     hoverinfo="skip", showlegend=False,
                 ))
@@ -1734,77 +1590,37 @@ def animate_occupancy(
         mid_x = [float(geom[i]["xs"][len(geom[i]["xs"]) // 2]) for i in range(n_edges)]
         mid_y = [float(geom[i]["ys"][len(geom[i]["ys"]) // 2]) for i in range(n_edges)]
         hover_text_0 = [
-            f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[0, i]}"
+            f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[0, i]:.0%}"
             for i in range(n_edges)
         ]
-        hover_trace = go.Scatter(
-            x=mid_x, y=mid_y, mode="markers",
+        fig.add_trace(ctx.scatter(
+            mid_x, mid_y, mode="markers",
             marker=dict(size=12, opacity=0),
             hovertemplate="%{text}<extra></extra>", text=hover_text_0,
             showlegend=False,
-        )
-        fig.add_trace(hover_trace)
+        ))
         hover_idx = len(fig.data) - 1
 
         frames = []
         for t in range(n_steps):
             frame_traces = _bin_traces(t)
             hover_t = [
-                f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[t, i]}"
+                f"edge {i} ({from_col[i]}\u2192{to_col[i]})<br>occ: {occupancy[t, i]:.0%}"
                 for i in range(n_edges)
             ]
-            frame_traces.append(go.Scatter(text=hover_t))
+            frame_traces.append(ctx.scatter([], [], text=hover_t))
             frames.append(go.Frame(
                 name=str(t), data=frame_traces,
                 traces=bin_indices_list + [hover_idx],
             ))
         fig.frames = frames
 
-    # --- layout ---
-    xs_all = [float(pos[n][0]) for n in pos]
-    ys_all = [float(pos[n][1]) for n in pos]
-    pad_x = (max(xs_all) - min(xs_all)) * 0.05 or 1.0
-    pad_y = (max(ys_all) - min(ys_all)) * 0.05 or 1.0
-    fig.update_xaxes(range=[min(xs_all) - pad_x, max(xs_all) + pad_x])
-    fig.update_yaxes(range=[min(ys_all) - pad_y, max(ys_all) + pad_y],
-                     scaleanchor="x", scaleratio=1)
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=10, b=90),
-        xaxis=dict(showgrid=False, zeroline=False, visible=True),
-        yaxis=dict(showgrid=False, zeroline=False, visible=True),
-        plot_bgcolor="white",
-    )
-
-    ms = max(1, int(1000 / max(1, play_fps)))
-    trans = {"duration": ms, "easing": "linear"} if tween else {"duration": 0}
-    play_args = {"fromcurrent": True, "frame": {"duration": ms, "redraw": True},
-                 "transition": trans}
+    # --- layout + animation controls ---
+    fig.update_layout(**ctx.base_layout())
+    ctx.apply_axis_range(fig, coords)
     slider_labels = [str(t_offset + int(step_indices[t])) for t in range(n_steps)]
-    fig.update_layout(
-        sliders=[{
-            "active": 0, "y": -0.07, "x": 0.15, "len": 0.72,
-            "pad": {"t": 20, "b": 0},
-            "currentvalue": {"prefix": "t = ", "visible": True},
-            "steps": [
-                {"args": [[str(t)], {"mode": "immediate",
-                                     "frame": {"duration": 0, "redraw": True},
-                                     "transition": {"duration": 0}}],
-                 "label": slider_labels[t], "method": "animate"}
-                for t in range(n_steps)
-            ],
-        }],
-        updatemenus=[{
-            "type": "buttons", "direction": "left",
-            "x": 0.02, "y": -0.12, "showactive": True,
-            "buttons": [{
-                "label": "\u25b6 / \u23f8", "method": "animate",
-                "args": [None, play_args],
-                "args2": [[None], {"mode": "immediate",
-                                   "frame": {"duration": 0, "redraw": True},
-                                   "transition": {"duration": 0}}],
-            }],
-        }],
-    )
+    _animation_layout(fig, n_steps, t_offset, play_fps, tween,
+                       use_map=ctx.use_map, step_labels=slider_labels)
 
     return fig
 
@@ -1815,14 +1631,13 @@ def animate_occupancy(
 
 def animate_occupancy_map(
     edges_df,
-    logs: np.ndarray,
+    occupancy: np.ndarray,
     pos_latlon: Dict[Hashable, tuple],
     *,
-    capacity: Optional[np.ndarray | int | str | float] = None,
     play_fps: int = 5,
     edge_width: float = 4.0,
     edge_geometries: Optional[Dict[int, list]] = None,
-    map_style: str = "open-street-map",
+    map_style: str = "carto-positron",
     map_zoom: Optional[int] = None,
     tween: bool = True,
     max_frames: int = 200,
@@ -1834,8 +1649,8 @@ def animate_occupancy_map(
         DeprecationWarning, stacklevel=2,
     )
     return animate_occupancy(
-        edges_df, logs, pos_latlon=pos_latlon,
-        capacity=capacity, play_fps=play_fps, edge_width=edge_width,
+        edges_df, occupancy, pos_latlon=pos_latlon,
+        play_fps=play_fps, edge_width=edge_width,
         edge_geometries=edge_geometries, map_style=map_style,
         map_zoom=map_zoom, tween=tween, max_frames=max_frames,
     )
@@ -1847,10 +1662,9 @@ def animate_occupancy_map(
 
 def animate_occupancy_mpl(
     edges_df,
-    logs: np.ndarray,
+    occupancy: np.ndarray,
     pos: Optional[Dict[Hashable, tuple]] = None,
     *,
-    capacity: Optional[np.ndarray | int | str | float] = None,
     play_fps: int = 10,
     edge_width: float = 3.0,
     max_frames: int = 200,
@@ -1878,13 +1692,12 @@ def animate_occupancy_mpl(
     ----------
     edges_df : DataFrame
         Edges table.
-    logs : ndarray of shape ``(steps, n_vehicles, 2)``
-        Position log.
+    occupancy : ndarray of shape ``(n_steps, n_edges)``
+        Pre-computed occupancy ratios in [0, 1] (e.g. from
+        :func:`compute_occupancy`).
     pos : dict or None
         Node positions.  Auto-computed if *None* and *edge_geometries* is
         not provided.
-    capacity : ndarray, int, float, ``"DELTA"``, or None
-        Per-edge capacity.
     play_fps : int
         Playback frames per second.
     edge_width : float
@@ -1920,28 +1733,25 @@ def animate_occupancy_mpl(
     except ImportError:
         raise ImportError("matplotlib is required for animate_occupancy_mpl(). Install with: pip install matplotlib")
 
-    if logs.ndim != 3 or logs.shape[2] != 2:
-        raise ValueError(f"logs must have shape (steps, n_vehicles, 2), got {logs.shape}")
+    if occupancy.ndim != 2:
+        raise ValueError(f"occupancy must have shape (n_steps, n_edges), got {occupancy.shape}")
 
     # --- time range slicing ---
     _t0 = t_start if t_start is not None else 0
-    _t1 = t_end if t_end is not None else logs.shape[0]
+    _t1 = t_end if t_end is not None else occupancy.shape[0]
     t_offset = _t0
-    logs = logs[_t0:_t1]
+    occupancy = occupancy[_t0:_t1]
 
-    n_steps_raw = logs.shape[0]
+    n_steps_raw = occupancy.shape[0]
     n_edges = len(edges_df)
 
-    # --- occupancy + subsample ---
-    occupancy = _compute_occupancy(logs, n_edges)
+    # --- subsample ---
     if n_steps_raw > max_frames:
         step_indices = np.linspace(0, n_steps_raw - 1, max_frames, dtype=int)
         occupancy = occupancy[step_indices]
     else:
         step_indices = np.arange(n_steps_raw)
     n_steps = len(step_indices)
-
-    cap = _resolve_capacity(capacity, occupancy, edges_df, n_edges)
 
     # --- build segments ---
     if edge_geometries is not None:
@@ -1979,7 +1789,7 @@ def animate_occupancy_mpl(
     ax.set_aspect("equal")
 
     lc = LineCollection(segments, linewidths=edge_width, cmap=cmap, clim=(0, 1))
-    ratios_0 = np.clip(occupancy[0] / cap, 0.0, 1.0)
+    ratios_0 = np.clip(occupancy[0], 0.0, 1.0)
     lc.set_array(ratios_0)
     ax.add_collection(lc)
 
@@ -2014,7 +1824,7 @@ def animate_occupancy_mpl(
         return (lc, title_text)
 
     def _update(frame):
-        ratios = np.clip(occupancy[frame] / cap, 0.0, 1.0)
+        ratios = np.clip(occupancy[frame], 0.0, 1.0)
         lc.set_array(ratios)
         title_text.set_text(f"t = {t_offset + int(step_indices[frame])}")
         return (lc, title_text)
@@ -2040,19 +1850,20 @@ def animate_occupancy_mpl(
 # ---------------------------------------------------------------------------
 
 def plot_edge_occupancy(
-    logs: np.ndarray,
+    occupancy: np.ndarray,
     edges_df,
     *,
     edge_indices: Optional[list[int]] = None,
     t_start: Optional[int] = None,
     t_end: Optional[int] = None,
 ) -> go.Figure:
-    """Plot number of vehicles on each edge over time.
+    """Plot per-edge occupancy ratio over time.
 
     Parameters
     ----------
-    logs : ndarray of shape ``(steps, n_vehicles, 2)``
-        Position log (same format as :func:`animate`).
+    occupancy : ndarray of shape ``(n_steps, n_edges)``
+        Pre-computed occupancy ratios in [0, 1] (e.g. from
+        :func:`compute_occupancy`).
     edges_df : DataFrame
         Edges table.
     edge_indices : list of int or None
@@ -2064,22 +1875,16 @@ def plot_edge_occupancy(
     """
     # --- time range slicing ---
     _t0 = t_start if t_start is not None else 0
-    _t1 = t_end if t_end is not None else logs.shape[0]
+    _t1 = t_end if t_end is not None else occupancy.shape[0]
     t_offset = _t0
-    logs = logs[_t0:_t1]
+    occupancy = occupancy[_t0:_t1]
 
-    n_steps, n_veh, _ = logs.shape
+    n_steps = occupancy.shape[0]
     n_edges = len(edges_df)
     if edge_indices is None:
         edge_indices = list(range(n_edges))
 
-    # Vectorized occupancy counting
-    occupancy = np.zeros((n_steps, n_edges), dtype=int)
-    e_flat = logs[:, :, 0].astype(int)
-    t_idx = np.repeat(np.arange(n_steps), n_veh)
-    e_flat_1d = e_flat.ravel()
-    mask = (e_flat_1d >= 0) & (e_flat_1d < n_edges)
-    np.add.at(occupancy, (t_idx[mask], e_flat_1d[mask]), 1)
+    y_values = occupancy * 100.0
 
     fig = go.Figure()
     from_col = edges_df["from"].values.astype(int)
@@ -2087,11 +1892,11 @@ def plot_edge_occupancy(
     for ei in edge_indices:
         u, v = int(from_col[ei]), int(to_col[ei])
         fig.add_trace(go.Scatter(
-            x=list(range(t_offset, t_offset + n_steps)), y=occupancy[:, ei],
+            x=list(range(t_offset, t_offset + n_steps)), y=y_values[:, ei],
             mode="lines", name=f"edge {ei} ({u}\u2192{v})",
         ))
     fig.update_layout(
-        xaxis_title="Time step", yaxis_title="Vehicles on edge",
+        xaxis_title="Time step", yaxis_title="Occupancy (%)",
         template="simple_white",
     )
     return fig
@@ -2105,6 +1910,8 @@ __all__ = [
     "animate_occupancy",
     "animate_occupancy_map",  # deprecated
     "animate_occupancy_mpl",
+    "compute_occupancy",
+    "compute_edge_capacity",
     "from_osmnx",
     "plot_edge_occupancy",
     "OSMnxResult",

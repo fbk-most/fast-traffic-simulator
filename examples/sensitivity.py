@@ -37,7 +37,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from fts import Simulator
-from fts.visualization import from_osmnx, plot_network
+from fts.visualization import compute_edge_capacity, from_osmnx
 from sensitivity_analysis_framework import (
     run_sensitivity_analysis,
     print_summary,
@@ -68,7 +68,7 @@ SERIES_AXIS = np.arange(MAX_STEPS)
 REROUTE_POLICIES = [
     None,   # index 0: no rerouting
     100,    # index 1: reroute every 100 steps (infrequent)
-    20,     # index 2: reroute every 20 steps  (frequent)
+    10,     # index 2: reroute every 20 steps  (frequent)
 ]
 N_REROUTE_POLICIES = len(REROUTE_POLICIES)
 
@@ -78,7 +78,7 @@ SA_PROBLEM = {
     "names": ["delta", "demand", "od_seed", "reroute_policy"],
     "bounds": [
         [2.0, 20.0],               # delta (m): reciprocal of max density; 2 m → dense; 20 m → sparse
-        [10, 100],                 # demand: total vehicles
+        [50, 100],                 # demand: total vehicles
         [0, 1000],                 # od_seed: cast to int → selects one OD matrix
         [0, N_REROUTE_POLICIES],   # reroute_policy: continuous proxy → floor → discrete index
     ],
@@ -140,7 +140,7 @@ def corner_nodes(pos_proj, pos_ll, N_CORNER=20, plot=True, out_dir=None):
             name=f"Top-right {N_CORNER}",
         ))
         fig.update_layout(
-            map=dict(style="open-street-map", zoom=13,
+            map=dict(style="carto-positron", zoom=13,
                      center=dict(lat=46.130, lon=11.247)),
             margin=dict(l=0, r=0, t=30, b=0),
             title=f"{N_CORNER} closest nodes to bottom-left (blue) and top-right (red) corners",
@@ -156,15 +156,10 @@ def corner_nodes(pos_proj, pos_ll, N_CORNER=20, plot=True, out_dir=None):
 nodes_bl, nodes_tr = corner_nodes(pos_proj, pos_ll, N_CORNER=N_CORNER, plot=True, out_dir=None)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Part 3 — Auto-select edge of interest (if not set manually)
+# Part 3 — Select edge of interest (if not set manually)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Static network plot on map tiles
-fig_net_osm = plot_network(edges_osm, pos_latlon=pos_ll)
-fig_net_osm.write_html(os.path.join(OUT_DIR, "map_network.html"))
-print(f"  -> {OUT_DIR}/map_network.html")
-
-EDGE_OF_INTEREST = 10
+EDGE_OF_INTEREST = 388
 
 # Pre-compute edge properties needed for occupancy
 _edge_length = float(edges_osm.iloc[EDGE_OF_INTEREST]["length"])
@@ -222,43 +217,37 @@ def simulator_fn(
         "start":       start_times,
     })
 
-    # --- Override DELTA on the class (reset in finally) ---
-    original_delta = Simulator.DELTA
-    Simulator.DELTA = np.float32(delta)
-    try:
-        sim, _ = Simulator.build(
-            edges=edges_osm,
-            vehicles=vehicles_df,
-            fix_unreachable=True,
-            random=RANDOM_PRIORITY,
-            rng=rng if RANDOM_PRIORITY else None,
+    sim, _ = Simulator.build(
+        edges=edges_osm,
+        vehicles=vehicles_df,
+        delta=delta,
+        fix_unreachable=True,
+        random=RANDOM_PRIORITY,
+        rng=rng if RANDOM_PRIORITY else None,
+    )
+
+    # capacity from the common function (single source of truth)
+    capacity = int(compute_edge_capacity(edges_osm, delta)[EDGE_OF_INTEREST])
+
+    max_step    = int(series_axis[-1]) + 1
+    occ_buffer  = np.zeros(max_step, dtype=np.float32)
+
+    for t in range(max_step):
+        count = int((sim.vehicles.edge == EDGE_OF_INTEREST).sum())
+        occ_buffer[t] = min(count / capacity * 100.0, 100.0)
+
+        nr_active = (
+            (sim.vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
+            + (sim.vehicles.status == Simulator.VehicleStatus.AT_NODE.value).sum()
+            + (sim.vehicles.status == Simulator.VehicleStatus.IN_EDGE.value).sum()
         )
+        if nr_active == 0:
+            break  # remaining entries stay 0
 
-        # capacity depends on current delta
-        capacity = max(1, int(_edge_length / delta)) * _edge_lanes
+        update_routes = do_reroute and (t % reroute_interval == 0)
+        sim.step(update_next_leg=update_routes)
 
-        max_step    = int(series_axis[-1]) + 1
-        occ_buffer  = np.zeros(max_step, dtype=np.float32)
-
-        for t in range(max_step):
-            count = int((sim.vehicles.edge == EDGE_OF_INTEREST).sum())
-            occ_buffer[t] = min(count / capacity * 100.0, 100.0)
-
-            nr_active = (
-                (sim.vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
-                + (sim.vehicles.status == Simulator.VehicleStatus.AT_NODE.value).sum()
-                + (sim.vehicles.status == Simulator.VehicleStatus.IN_EDGE.value).sum()
-            )
-            if nr_active == 0:
-                break  # remaining entries stay 0
-
-            update_routes = do_reroute and (t % reroute_interval == 0)
-            sim.step(update_next_leg=update_routes)
-
-        return occ_buffer[series_axis]
-
-    finally:
-        Simulator.DELTA = original_delta
+    return occ_buffer[series_axis]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -277,95 +266,9 @@ results = run_sensitivity_analysis(
 print_summary(results)
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Part 6 — Launch interactive Dash dashboard
+# Part 7 — Launch interactive Dash dashboard
 # ═══════════════════════════════════════════════════════════════════════════
 
 app = build_dash_app(results)
 print("\nStarting dashboard at http://127.0.0.1:8050/")
 app.run(debug=False)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Part 7 — Concrete animation for a fixed parameter set
-# ═══════════════════════════════════════════════════════════════════════════
-# Visualise a single representative run so you can inspect vehicle movement
-# on the real OSMnx network.  Edit the parameters below to explore scenarios.
-
-from fts.visualization import animate
-
-ANIM_DELTA          = 5.0    # min following distance (m)
-ANIM_DEMAND         = 60     # number of vehicles
-ANIM_OD_SEED        = 42     # OD matrix seed
-ANIM_REROUTE_POLICY = 1      # 0=none, 1=every-100-steps, 2=every-20-steps
-ANIM_MAX_STEPS      = MAX_STEPS
-
-print("\n═══ Building animation ═══")
-print(f"  delta={ANIM_DELTA} m, demand={ANIM_DEMAND}, "
-      f"od_seed={ANIM_OD_SEED}, "
-      f"reroute_policy={ANIM_REROUTE_POLICY} "
-      f"(interval={REROUTE_POLICIES[ANIM_REROUTE_POLICY]})")
-
-_anim_od_rng     = np.random.default_rng(ANIM_OD_SEED)
-_anim_origins    = _anim_od_rng.choice(nodes_bl, size=ANIM_DEMAND, replace=True)
-_anim_dests      = _anim_od_rng.choice(nodes_tr, size=ANIM_DEMAND, replace=True)
-_anim_starts     = np.zeros(ANIM_DEMAND, dtype=np.int32)   # deterministic for animation
-
-_anim_vehicles_df = pd.DataFrame({
-    "origin":      _anim_origins,
-    "destination": _anim_dests,
-    "start":       _anim_starts,
-})
-
-_orig_delta      = Simulator.DELTA
-Simulator.DELTA  = np.float32(ANIM_DELTA)
-try:
-    _anim_sim, _  = Simulator.build(
-        edges=edges_osm,
-        vehicles=_anim_vehicles_df,
-        fix_unreachable=True,
-        random=False,
-    )
-    _anim_interval = REROUTE_POLICIES[ANIM_REROUTE_POLICY]
-    _do_reroute    = _anim_interval is not None
-
-    _step_logs  = []
-    _lane_logs  = []
-
-    def _snapshot(sim):
-        log = np.vstack([sim.vehicles.edge, sim.vehicles.edge_distance])
-        log[1, sim.vehicles.edge == -1] = 0
-        return log.swapaxes(0, 1)
-
-    _step_logs.append(_snapshot(_anim_sim))
-    _lane_logs.append(_anim_sim.vehicles.lane.copy())
-
-    for _t in range(ANIM_MAX_STEPS):
-        _nr_active = (
-            (_anim_sim.vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
-            + (_anim_sim.vehicles.status == Simulator.VehicleStatus.AT_NODE.value).sum()
-            + (_anim_sim.vehicles.status == Simulator.VehicleStatus.IN_EDGE.value).sum()
-        )
-        if _nr_active == 0:
-            break
-        _update_routes = _do_reroute and (_t % _anim_interval == 0)
-        _anim_sim.step(update_next_leg=_update_routes)
-        _step_logs.append(_snapshot(_anim_sim))
-        _lane_logs.append(_anim_sim.vehicles.lane.copy())
-
-    _logs      = np.array(_step_logs)
-    _lane_logs = np.array(_lane_logs)
-    print(f"  Collected {_logs.shape[0]} steps for {_logs.shape[1]} vehicles")
-finally:
-    Simulator.DELTA = _orig_delta
-
-_anim_fig = animate(
-    edges_osm,
-    _logs,
-    pos_latlon=pos_ll,
-    lane_logs=_lane_logs,
-    play_fps=10,
-    tween=True,
-)
-_anim_path = f"{OUT_DIR}/animation_delta{ANIM_DELTA}_demand{ANIM_DEMAND}_policy{ANIM_REROUTE_POLICY}.html"
-_anim_fig.write_html(_anim_path)
-print(f"  Animation saved → {_anim_path}")
-_anim_fig.show()

@@ -124,6 +124,10 @@ class Simulator:
                 step.
             entered_edge_now: Boolean mask — ``True`` for vehicles that entered
                 an edge this step.
+            node_wait_since: Simulation step at which each vehicle last became
+                ``AT_NODE``. Used to implement first-come-first-serve priority
+                at intersections when ``random=False``. ``END_OF_TIME`` for
+                vehicles not yet at a node.
         """
 
         origin: np.ndarray
@@ -139,6 +143,7 @@ class Simulator:
         started_now: np.ndarray = field(init=False)
         arrived_now: np.ndarray = field(init=False)
         entered_edge_now: np.ndarray = field(init=False)
+        node_wait_since: np.ndarray = field(init=False)
 
         def __post_init__(self) -> None:
             nr_vehicles = self.origin.shape[0]
@@ -152,6 +157,7 @@ class Simulator:
             self.started_now = np.full(nr_vehicles, False, dtype=np.bool_)
             self.arrived_now = np.full(nr_vehicles, False, dtype=np.bool_)
             self.entered_edge_now = np.full(nr_vehicles, False, dtype=np.bool_)
+            self.node_wait_since = np.full(nr_vehicles, Simulator.END_OF_TIME, dtype=np.int32)
 
     @dataclass
     class EdgesRecord:
@@ -191,6 +197,7 @@ class Simulator:
         edges,
         vehicles,
         *,
+        delta: float | None = None,
         random: bool = False,
         rng: np.random.Generator | None = None,
     ) -> None:
@@ -205,6 +212,8 @@ class Simulator:
                 integers starting from 0.
             vehicles: DataFrame with columns ``origin``, ``destination``, and
                 ``start`` (departure time step).
+            delta: Minimum safe following distance in metres. If *None*,
+                falls back to the class-level ``Simulator.DELTA``.
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
@@ -212,6 +221,7 @@ class Simulator:
                 ``None`` and ``random=True``, a fresh Generator is created via
                 ``numpy.random.default_rng()``.
         """
+        self._delta = np.float32(delta) if delta is not None else Simulator.DELTA
         self._random = random
         self._rng: np.random.Generator | None = (
             np.random.default_rng() if (random and rng is None) else rng
@@ -251,6 +261,7 @@ class Simulator:
         edges,
         vehicles,
         *,
+        delta: float | None = None,
         fix_unreachable: bool = False,
         random: bool = False,
         rng: np.random.Generator | None = None,
@@ -267,6 +278,8 @@ class Simulator:
                 integers starting from 0.
             vehicles: DataFrame with columns ``origin``, ``destination``, and
                 ``start`` (departure time step).
+            delta: Minimum safe following distance in metres. If *None*,
+                falls back to the class-level ``Simulator.DELTA``.
             fix_unreachable: Controls behaviour when vehicles with unreachable
                 destinations are found (i.e. no path exists from origin to
                 destination). If ``True``, their destination is reset to their
@@ -291,7 +304,7 @@ class Simulator:
             ValueError: If ``fix_unreachable=False`` and one or more vehicles
                 have unreachable destinations.
         """
-        simulator = cls(edges, vehicles, random=random, rng=rng)
+        simulator = cls(edges, vehicles, delta=delta, random=random, rng=rng)
 
         # Compute the routing.
         # Note that from/to are inverted so that Dijkstra returns the *successor*
@@ -325,6 +338,11 @@ class Simulator:
 
         simulator._ready = True
         return simulator, fixed
+
+    @property
+    def delta(self) -> np.float32:
+        """Minimum safe following distance used by this simulator instance."""
+        return self._delta
 
     @property
     def vehicles(self) -> 'Simulator.VehiclesRecord':
@@ -391,6 +409,7 @@ class Simulator:
             starting = (self._vehicles.start_time == self._now) & (self._vehicles.status == waiting_status)
             if np.any(starting):
                 self._vehicles.status[starting] = at_node_status
+                self._vehicles.node_wait_since[starting] = self._now
                 self._vehicles.started_now[starting] = True
 
         do_starting()
@@ -402,6 +421,7 @@ class Simulator:
                 (self._vehicles.edge_distance == self._edges.length[self._vehicles.edge])
             )
             self._vehicles.status[vehicles] = at_node_status
+            self._vehicles.node_wait_since[vehicles] = self._now
 
         do_out_of_edge()
 
@@ -456,7 +476,8 @@ class Simulator:
                 assert not (next_nodes == -9999).any()
 
                 # Get unique edges targeted by the vehicles, and the corresponding vehicles.
-                # Shuffling is performed for random simulations.
+                # Shuffling is performed for random simulations; otherwise first-come-first-serve
+                # by node_wait_since (ties broken by vehicle id).
                 if self._random:
                     assert self._rng is not None
                     order = np.arange(len(next_edges))
@@ -464,7 +485,12 @@ class Simulator:
                     unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
                     unique_vehicles = order[unique_vehicles]
                 else:
-                    unique_edges, unique_vehicles = np.unique(next_edges, return_index=True)
+                    entering_vehicle_ids = entering_edge.nonzero()[0]
+                    wait_since = self._vehicles.node_wait_since[entering_vehicle_ids]
+                    # stable sort: primary key = wait_since (ascending), secondary = vehicle id (ascending)
+                    order = np.lexsort((entering_vehicle_ids, wait_since))
+                    unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
+                    unique_vehicles = order[unique_vehicles]
 
                 # Restrict to edges that have at least one free lane
                 lane_distances = np.select(
@@ -479,7 +505,7 @@ class Simulator:
                         self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]],
                     ],
                 )
-                free_edges = (lane_distances >= Simulator.DELTA).any(axis=1)
+                free_edges = (lane_distances >= self._delta).any(axis=1)
 
                 if not free_edges.any():
                     break
@@ -504,6 +530,7 @@ class Simulator:
 
                 # Transition to IN_EDGE and update all auxiliary fields
                 self._vehicles.status[vehicles] = in_edge_status
+                self._vehicles.node_wait_since[vehicles] = Simulator.END_OF_TIME
                 self._vehicles.entered_edge_now[vehicles] = True
                 self._vehicles.edge[vehicles] = edges
                 self._vehicles.lane[vehicles] = lanes
@@ -532,7 +559,7 @@ class Simulator:
                 self._vehicles.edge_distance[in_edge_follow]
                 + self._edges.speed[self._vehicles.edge[in_edge_follow]],
                 self._vehicles.edge_distance[self._vehicles.lane_front_vehicle[in_edge_follow]]
-                - Simulator.DELTA,
+                - self._delta,
             )
 
             if update_next_leg:
