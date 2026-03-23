@@ -216,6 +216,7 @@ def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range |
                               n_samples=N_SAMPLES, n_replicas=N_REPLICAS,
                               conf_level=CONFIDENCE_LVL, seed=SEED,
                               precomputed_timeseries=None,
+                              precomputed_param_samples=None,
                               analyze_variance=True):
     """Run simulations + Sobol/PAWN on mean and variance. Threshold-independent.
 
@@ -241,7 +242,11 @@ def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range |
 
     names = problem["names"]; num_vars = problem["num_vars"]
     print(f"Saltelli samples (N={n_samples}, D={num_vars}) ...")
-    param_samples = sobol_sample.sample(problem, n_samples, calc_second_order=True, seed=seed)
+    if precomputed_param_samples is not None:
+        param_samples = precomputed_param_samples
+        print(f"Using precomputed param_samples {param_samples.shape}")
+    else:
+        param_samples = sobol_sample.sample(problem, n_samples, calc_second_order=True, seed=seed)
     n_ps = param_samples.shape[0]
     print(f"  {n_ps} parameter sets")
 
@@ -491,7 +496,7 @@ def build_dash_app(results, initial_threshold=THRESHOLD_INIT):
     # =====================================================================
     flat = all_ts.reshape(-1, n_ts)
     ylo = float(np.percentile(flat,0.5)); yhi = float(np.percentile(flat,99.5))
-    ypad = (yhi-ylo)*0.05; y_range = [ylo-ypad, yhi+ypad]
+    ypad = max((yhi-ylo)*0.05, 1.0); y_range = [ylo-ypad, yhi+ypad]
     pmins = param_samples.min(0); pmaxs = param_samples.max(0)
     pranges = pmaxs-pmins; pranges[pranges==0]=1.0
     normed = (param_samples-pmins)/pranges

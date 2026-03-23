@@ -270,10 +270,12 @@ BUNDLE_NAME = (
 
 print("\n═══ Running sensitivity analysis ═══")
 bundle_file = os.path.join(RUNS_DIR, f"{BUNDLE_NAME}.npz")
+cached_param_samples = None
 if os.path.exists(bundle_file):
     print(f"Loading cached bundle: {BUNDLE_NAME}")
     cached = np.load(bundle_file)
     all_edges_ts = cached["timeseries"]  # (n_ps, n_replicas, n_steps, n_edges)
+    cached_param_samples = cached["param_samples"] if "param_samples" in cached else None
     print(f"  shape: {all_edges_ts.shape}")
 else:
     # Run all simulations once, recording every edge.
@@ -296,7 +298,7 @@ else:
             print(f"  {i + 1}/{n_ps}")
 
     os.makedirs(RUNS_DIR, exist_ok=True)
-    np.savez_compressed(bundle_file, timeseries=all_edges_ts)
+    np.savez_compressed(bundle_file, timeseries=all_edges_ts, param_samples=param_samples)
     print(f"Saved all-edges bundle: {BUNDLE_NAME}")
 
 # Extract edge of interest and run analysis (no simulation needed)
@@ -310,6 +312,7 @@ results = run_sensitivity_analysis(
     n_replicas=N_REPLICAS,
     seed=SEED,
     precomputed_timeseries=edge_ts,
+    precomputed_param_samples=cached_param_samples,
     analyze_variance=ANALYZE_VARIANCE,
 )
 
