@@ -48,15 +48,19 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 BBOX = (11.227499490547554, 46.11477985577746, 11.26659598835508, 46.145001069749725)
 
-# Edge index to observe. Set to None to auto-select the edge with the most
-# traffic in a reference run, or set to an integer (0-based row index in
-# edges_osm) to pick a specific road.
-EDGE_OF_INTEREST: int | None = None
-
 # Time axis: occupancy is recorded at each of these steps.
 # Increase MAX_STEPS if many vehicles haven't arrived by step 500.
 MAX_STEPS = 500
 SERIES_AXIS = np.arange(MAX_STEPS)
+
+ANIM_DELTA          = 5.0    # min following distance (m)
+ANIM_DEMAND         = 500     # number of vehicles
+ANIM_OD_SEED        = 42     # OD matrix seed
+ANIM_REROUTE_POLICY = 0      # 0=none, 1=every-100-steps, 2=every-20-steps
+ANIM_MAX_STEPS      = MAX_STEPS
+
+# Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
+RANDOM_PRIORITY = False
 
 # Rerouting policy catalogue (GPF discrete realizations).
 # Each entry is an interval in steps; None means no rerouting.
@@ -65,21 +69,16 @@ REROUTE_POLICIES = [
     100,    # index 1: reroute every 100 steps (infrequent)
     20,     # index 2: reroute every 20 steps  (frequent)
 ]
-N_REROUTE_POLICIES = len(REROUTE_POLICIES)
 
-# SALib / framework settings
-SA_PROBLEM = {
-    "num_vars": 4,
-    "names": ["delta", "demand", "od_seed", "reroute_policy"],
-    "bounds": [
-        [2.0, 20.0],               # delta (m): reciprocal of max density; 2 m → dense; 20 m → sparse
-        [10, 100],                 # demand: total vehicles
-        [0, 1000],                 # od_seed: cast to int → selects one OD matrix
-        [0, N_REROUTE_POLICIES],   # reroute_policy: continuous proxy → floor → discrete index
-    ],
-}
+N_CORNER   = 4    # nodes near each corner used as origins / destinations
 
-N_CORNER   = 20    # nodes near each corner used as origins / destinations
+# Optional: set explicit node lists to use as origins / destinations.
+# If None, the N_CORNER closest nodes to each corner are used instead.
+NODES_BL: list[int] | None = None  # e.g. [123456, 234567, 345678]
+NODES_TR: list[int] | None = None  # e.g. [456789, 567890]
+
+NODES_BL = [4, 126, 271, 261]
+NODES_TR = [160, 98, 157]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 1 — Load network
@@ -146,14 +145,20 @@ def corner_nodes(pos_proj, pos_ll, N_CORNER=20, plot=True, out_dir=None):
     return nodes_bl, nodes_tr
 
 
-nodes_bl, nodes_tr = corner_nodes(pos_proj, pos_ll, N_CORNER=N_CORNER, plot=True, out_dir=None)
+if NODES_BL is not None and NODES_TR is not None:
+    nodes_bl = np.array(NODES_BL)
+    nodes_tr = np.array(NODES_TR)
+    print(f"Using explicit origin nodes  ({len(nodes_bl)}): {nodes_bl.tolist()}")
+    print(f"Using explicit dest nodes    ({len(nodes_tr)}): {nodes_tr.tolist()}")
+else:
+    nodes_bl, nodes_tr = corner_nodes(pos_proj, pos_ll, N_CORNER=N_CORNER, plot=True, out_dir=None)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 3 — Select edge of interest (if not set manually)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Static network plot on map tiles
-fig_net_osm = plot_network(edges_osm, pos_latlon=pos_ll)
+fig_net_osm = plot_network(edges_osm, pos_latlon=pos_ll, highlight_nodes=[236,215,148,424,412,436,20,18])
 fig_net_osm.write_html(os.path.join(OUT_DIR, "map_network.html"))
 print(f"  -> {OUT_DIR}/map_network.html")
 
@@ -162,15 +167,6 @@ print(f"  -> {OUT_DIR}/map_network.html")
 # ═══════════════════════════════════════════════════════════════════════════
 # Visualise a single representative run so you can inspect vehicle movement
 # on the real OSMnx network.  Edit the parameters below to explore scenarios.
-
-ANIM_DELTA          = 5.0    # min following distance (m)
-ANIM_DEMAND         = 100     # number of vehicles
-ANIM_OD_SEED        = 42     # OD matrix seed
-ANIM_REROUTE_POLICY = 0      # 0=none, 1=every-100-steps, 2=every-20-steps
-ANIM_MAX_STEPS      = MAX_STEPS
-
-# Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
-RANDOM_PRIORITY = False
 
 print("\n═══ Building animation ═══")
 print(f"  delta={ANIM_DELTA} m, demand={ANIM_DEMAND}, "
@@ -260,8 +256,8 @@ print(f"  -> {OUT_DIR}/map_edge_occupancy.html")
 fig_occ_map = animate_occupancy(
     edges_osm, _occupancy, pos_latlon=pos_ll,
     edge_geometries=edge_geoms,
-    play_fps=5,
-    max_frames=len(_logs),  # show ALL steps, no subsampling
+    play_fps=10,
+    max_frames=len(_logs),
 )
 fig_occ_map.write_html(os.path.join(OUT_DIR, "map_occupancy_animation.html"))
 print(f"  -> {OUT_DIR}/map_occupancy_animation.html")

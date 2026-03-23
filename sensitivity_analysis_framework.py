@@ -215,7 +215,8 @@ def _heatmap_single_pair(param_samples, max_exceed, idx_i, idx_j,
 def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range | np.ndarray" = N_SERIES_AXIS,
                               n_samples=N_SAMPLES, n_replicas=N_REPLICAS,
                               conf_level=CONFIDENCE_LVL, seed=SEED,
-                              precomputed_timeseries=None):
+                              precomputed_timeseries=None,
+                              analyze_variance=True):
     """Run simulations + Sobol/PAWN on mean and variance. Threshold-independent.
 
     Parameters
@@ -263,9 +264,12 @@ def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range |
     tv_mean = np.var(mean_ts, axis=0); tv_var = np.var(var_ts, axis=0)
 
     print("Sobol on E[Y|theta] ..."); sm = _sobol_at_each_timestep(problem, mean_ts, n_points, conf_level)
-    print("Sobol on Var[Y|theta] ..."); sv = _sobol_at_each_timestep(problem, var_ts, n_points, conf_level)
     print("PAWN on E[Y|theta] ..."); pm = _pawn_at_each_timestep(problem, param_samples, mean_ts, n_points)
-    print("PAWN on Var[Y|theta] ..."); pv = _pawn_at_each_timestep(problem, param_samples, var_ts, n_points)
+    if analyze_variance:
+        print("Sobol on Var[Y|theta] ..."); sv = _sobol_at_each_timestep(problem, var_ts, n_points, conf_level)
+        print("PAWN on Var[Y|theta] ..."); pv = _pawn_at_each_timestep(problem, param_samples, var_ts, n_points)
+    else:
+        sv = None; pv = None; tv_var = None
 
     print("Done.")
     return {"param_samples": param_samples, "timeseries": all_ts,
@@ -280,12 +284,14 @@ def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range |
 def print_summary(results):
     names = results["problem"]["names"]
     for label, sk in [("MEAN","sobol_mean"),("VAR","sobol_var")]:
+        if results[sk] is None: continue
         s = results[sk]; S1=s["S1"]; ST=s["ST"]
         print(f"\n{'='*60}\n  Sobol -- {label}\n{'='*60}")
         a1=S1.mean(); aT=ST.mean()
         for n in a1.sort_values(ascending=False).index:
             print(f"    {n:>8s}: S1={a1[n]:+.4f}  ST={aT[n]:+.4f}")
     for label, pk in [("MEAN","pawn_mean"),("VAR","pawn_var")]:
+        if results[pk] is None: continue
         avg=results[pk]["median"].mean()
         print(f"\n  PAWN ({label}) time-averaged:")
         for n in avg.sort_values(ascending=False).index:
@@ -320,11 +326,12 @@ def build_dash_app(results, initial_threshold=THRESHOLD_INIT):
     # =====================================================================
     # LEFT: Sobol + PAWN figure (static, built once)
     # =====================================================================
+    has_var = results["sobol_var"] is not None
+    n_cols = 2 if has_var else 1
+
     def _make_sobol_fig():
-        fig = make_subplots(
-            rows=5, cols=2, vertical_spacing=0.06, horizontal_spacing=0.08,
-            row_heights=[0.22, 0.19, 0.17, 0.22, 0.20],
-            subplot_titles=(
+        if has_var:
+            subplot_titles = (
                 "Abs. Variance (stacked) \u2014 Mean E[Y|\u03b8]",
                 "Abs. Variance (stacked) \u2014 Var[Y|\u03b8]",
                 "First-Order S1 (stacked) \u2014 Mean E[Y|\u03b8]",
@@ -335,11 +342,26 @@ def build_dash_app(results, initial_threshold=THRESHOLD_INIT):
                 "Total-Order ST & S1 \u2014 Var[Y|\u03b8]",
                 "PAWN (median, min\u2013max) \u2014 Mean E[Y|\u03b8]",
                 "PAWN (median, min\u2013max) \u2014 Var[Y|\u03b8]",
-            ))
+            )
+            col_iter = [
+                ("sobol_mean","total_var_of_mean","pawn_mean"),
+                ("sobol_var","total_var_of_var","pawn_var")]
+        else:
+            subplot_titles = (
+                "Abs. Variance (stacked) \u2014 Mean E[Y|\u03b8]",
+                "First-Order S1 (stacked) \u2014 Mean E[Y|\u03b8]",
+                "Second-Order S2 \u2014 Mean E[Y|\u03b8]",
+                "Total-Order ST & S1 \u2014 Mean E[Y|\u03b8]",
+                "PAWN (median, min\u2013max) \u2014 Mean E[Y|\u03b8]",
+            )
+            col_iter = [
+                ("sobol_mean","total_var_of_mean","pawn_mean")]
+        fig = make_subplots(
+            rows=5, cols=n_cols, vertical_spacing=0.06, horizontal_spacing=0.08,
+            row_heights=[0.22, 0.19, 0.17, 0.22, 0.20],
+            subplot_titles=subplot_titles)
         ci_indices = []
-        for ci, (sk, tvk, pk) in enumerate([
-            ("sobol_mean","total_var_of_mean","pawn_mean"),
-            ("sobol_var","total_var_of_var","pawn_var")], start=1):
+        for ci, (sk, tvk, pk) in enumerate(col_iter, start=1):
             sob = results[sk]; S1=sob["S1"]; ST=sob["ST"]
             S1c=sob["S1_conf"]; STc=sob["ST_conf"]
             S2=sob["S2"]; S2c=sob["S2_conf"]
@@ -452,13 +474,14 @@ def build_dash_app(results, initial_threshold=THRESHOLD_INIT):
         for a in fig.layout.annotations: a.font.size=12
         fig.update_yaxes(title_text="Var (units\u00b2)",row=1,col=1)
         fig.update_yaxes(title_text="S1",row=2,col=1,range=[0,1.05])
-        fig.update_yaxes(range=[0,1.05],row=2,col=2)
         fig.update_yaxes(title_text="S2",row=3,col=1)
         fig.update_yaxes(title_text="ST",row=4,col=1)
         fig.update_yaxes(title_text="PAWN",row=5,col=1,range=[0,1.05])
-        fig.update_yaxes(range=[0,1.05],row=5,col=2)
         fig.update_xaxes(title_text="Series",row=5,col=1)
-        fig.update_xaxes(title_text="Series",row=5,col=2)
+        if has_var:
+            fig.update_yaxes(range=[0,1.05],row=2,col=2)
+            fig.update_yaxes(range=[0,1.05],row=5,col=2)
+            fig.update_xaxes(title_text="Series",row=5,col=2)
         return fig
 
     sobol_fig = _make_sobol_fig()

@@ -616,6 +616,7 @@ def plot_network(
     parallel_exponent: float = 1.6,
     traffic_rule: Literal["right", "left"] = "right",
     curve_single_edges: bool = False,
+    highlight_nodes: Union[list, Dict[str, list], None] = None,
 ) -> go.Figure:
     """Plot the traffic network as an interactive Plotly figure.
 
@@ -713,7 +714,26 @@ def plot_network(
         name="nodes",
     )
 
-    fig = go.Figure(data=[edge_trace, edge_hover, node_trace])
+    highlight_traces = []
+    if highlight_nodes:
+        colors = ["red", "blue", "green", "orange", "purple", "cyan", "magenta"]
+        # Accept list of node IDs or dict {label: [node_ids]}
+        if isinstance(highlight_nodes, dict):
+            groups = highlight_nodes.items()
+        else:
+            groups = [("highlighted", list(highlight_nodes))]
+        for i, (label, node_ids) in enumerate(groups):
+            hx = [float(coords[n][0]) for n in node_ids if n in coords]
+            hy = [float(coords[n][1]) for n in node_ids if n in coords]
+            ht = [f"<b>node {n}</b> [{label}]" for n in node_ids if n in coords]
+            highlight_traces.append(ctx.scatter(
+                hx, hy, mode="markers",
+                marker=dict(size=node_size + 4, color=colors[i % len(colors)]),
+                hovertemplate="%{text}<extra></extra>", text=ht,
+                name=label, showlegend=True,
+            ))
+
+    fig = go.Figure(data=[edge_trace, edge_hover, node_trace, *highlight_traces])
     fig.update_layout(**ctx.base_layout())
     return fig
 
@@ -1328,7 +1348,7 @@ def compute_occupancy(logs: np.ndarray, edges_df, delta: float) -> np.ndarray:
     edges_df : DataFrame
         Edges table with ``length`` and ``lanes`` columns.
     delta : float
-        Minimum safe following distance (metres) used in the simulation.
+        Minimum safe following distance (metres).
 
     Returns
     -------
