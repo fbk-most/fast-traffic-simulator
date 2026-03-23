@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from tqdm import tqdm
 
 from fts import Simulator
 from fts.visualization import compute_edge_capacity, from_osmnx
@@ -63,7 +64,7 @@ NODES_BL = [4, 126, 271, 261]
 NODES_TR = [160, 98, 157]
 
 # Edge index to observe.
-EDGE_OF_INTEREST = 49
+EDGE_OF_INTEREST = 606
 
 # Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
 RANDOM_PRIORITY = False
@@ -87,13 +88,13 @@ SA_PROBLEM = {
     "num_vars": 3,
     "names": ["demand", "od_seed", "reroute_policy"],
     "bounds": [
-        [100, 200],                # demand: total vehicles
+        [250, 500],                # demand: total vehicles
         [0, 1000],                 # od_seed: cast to int → selects one OD matrix
         [0, N_REROUTE_POLICIES],   # reroute_policy: continuous proxy → floor → discrete index
     ],
 }
 
-N_SAMPLES  = 256    # Saltelli base N; total runs = N*(2*D+2) * n_replicas
+N_SAMPLES  = 1024    # Saltelli base N; total runs = N*(2*D+2) * n_replicas
 N_REPLICAS = 1      # stochastic replicas per parameter set (jittered start times)
 SEED       = 42     # seed for Saltelli sampling and replica RNG
 
@@ -289,13 +290,11 @@ else:
     print(f"Simulating {n_ps} x {N_REPLICAS} = {n_ps * N_REPLICAS} runs (all {n_edges} edges) ...")
     all_edges_ts = np.empty((n_ps, N_REPLICAS, n_points, n_edges), dtype=np.float32)
     base_rng = np.random.default_rng(SEED)
-    for i in range(n_ps):
+    for i in tqdm(range(n_ps), desc="Simulating"):
         p = {name: param_samples[i, j] for j, name in enumerate(names)}
         for r in range(N_REPLICAS):
             rng = np.random.default_rng(base_rng.integers(0, 2**31))
             all_edges_ts[i, r, :, :] = simulator_fn_all_edges(p, series_axis, rng)
-        if (i + 1) % max(1, n_ps // 10) == 0:
-            print(f"  {i + 1}/{n_ps}")
 
     os.makedirs(RUNS_DIR, exist_ok=True)
     np.savez_compressed(bundle_file, timeseries=all_edges_ts, param_samples=param_samples)

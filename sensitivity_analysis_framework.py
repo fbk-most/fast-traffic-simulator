@@ -22,6 +22,7 @@ from SALib.analyze import sobol
 from SALib.analyze import pawn as pawn_analyze
 from itertools import combinations
 import warnings
+from tqdm import tqdm
 from dash import Dash, dcc, html, Input, Output, Patch
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -254,16 +255,17 @@ def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range |
         print(f"Using precomputed timeseries {precomputed_timeseries.shape}")
         all_ts = precomputed_timeseries
     else:
-        print(f"Simulating {n_ps} x {n_replicas} = {n_ps*n_replicas} runs ...")
+        total_runs = n_ps * n_replicas
+        print(f"Simulating {n_ps} x {n_replicas} = {total_runs} runs ...")
         all_ts = np.empty((n_ps, n_replicas, n_points))
         base_rng = np.random.default_rng(seed)
-        for i in range(n_ps):
-            p = {name: param_samples[i,j] for j,name in enumerate(names)}
-            for r in range(n_replicas):
-                rng = np.random.default_rng(base_rng.integers(0, 2**31))
-                all_ts[i, r, :] = simulator_fn(p, series_axis, rng)
-            if (i+1) % max(1, n_ps//10) == 0:
-                print(f"  {i+1}/{n_ps}")
+        with tqdm(total=total_runs, unit="run", desc="Simulating") as pbar:
+            for i in range(n_ps):
+                p = {name: param_samples[i,j] for j,name in enumerate(names)}
+                for r in range(n_replicas):
+                    rng = np.random.default_rng(base_rng.integers(0, 2**31))
+                    all_ts[i, r, :] = simulator_fn(p, series_axis, rng)
+                    pbar.update(1)
 
     mean_ts = np.mean(all_ts, axis=1); var_ts = np.var(all_ts, axis=1)
     tv_mean = np.var(mean_ts, axis=0); tv_var = np.var(var_ts, axis=0)
@@ -478,14 +480,16 @@ def build_dash_app(results, initial_threshold=THRESHOLD_INIT):
                 ], font=dict(size=11),bgcolor="white",bordercolor="#ccc")])
         for a in fig.layout.annotations: a.font.size=12
         fig.update_yaxes(title_text="Var (units\u00b2)",row=1,col=1)
-        fig.update_yaxes(title_text="S1",row=2,col=1,range=[0,1.05])
-        fig.update_yaxes(title_text="S2",row=3,col=1)
-        fig.update_yaxes(title_text="ST",row=4,col=1)
-        fig.update_yaxes(title_text="PAWN",row=5,col=1,range=[0,1.05])
+        fig.update_yaxes(title_text="S1",row=2,col=1,range=[0,1])
+        fig.update_yaxes(title_text="S2",row=3,col=1,range=[0,1])
+        fig.update_yaxes(title_text="ST",row=4,col=1,range=[0,1])
+        fig.update_yaxes(title_text="PAWN",row=5,col=1,range=[0,1])
         fig.update_xaxes(title_text="Series",row=5,col=1)
         if has_var:
-            fig.update_yaxes(range=[0,1.05],row=2,col=2)
-            fig.update_yaxes(range=[0,1.05],row=5,col=2)
+            fig.update_yaxes(range=[0,1],row=2,col=2)
+            fig.update_yaxes(range=[0,1],row=3,col=2)
+            fig.update_yaxes(range=[0,1],row=4,col=2)
+            fig.update_yaxes(range=[0,1],row=5,col=2)
             fig.update_xaxes(title_text="Series",row=5,col=2)
         return fig
 

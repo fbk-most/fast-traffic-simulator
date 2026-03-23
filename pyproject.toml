@@ -29,6 +29,7 @@ dependencies = [
     "salib>=1.5.2",
     "dash>=4.0.0",
     "osmnx>=2.1.0",
+    "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]

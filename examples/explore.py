@@ -54,9 +54,9 @@ MAX_STEPS = 500
 SERIES_AXIS = np.arange(MAX_STEPS)
 
 ANIM_DELTA          = 5.0    # min following distance (m)
-ANIM_DEMAND         = 500     # number of vehicles
+ANIM_DEMAND         = 200     # number of vehicles
 ANIM_OD_SEED        = 42     # OD matrix seed
-ANIM_REROUTE_POLICY = 0      # 0=none, 1=every-100-steps, 2=every-20-steps
+ANIM_REROUTE_POLICY = 2      # 0=none, 1=every-100-steps, 2=every-20-steps
 ANIM_MAX_STEPS      = MAX_STEPS
 
 # Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
