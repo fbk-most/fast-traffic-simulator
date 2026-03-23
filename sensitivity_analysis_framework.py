@@ -214,7 +214,8 @@ def _heatmap_single_pair(param_samples, max_exceed, idx_i, idx_j,
 
 def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range | np.ndarray" = N_SERIES_AXIS,
                               n_samples=N_SAMPLES, n_replicas=N_REPLICAS,
-                              conf_level=CONFIDENCE_LVL, seed=SEED):
+                              conf_level=CONFIDENCE_LVL, seed=SEED,
+                              precomputed_timeseries=None):
     """Run simulations + Sobol/PAWN on mean and variance. Threshold-independent.
 
     Parameters
@@ -239,20 +240,24 @@ def run_sensitivity_analysis(simulator_fn, problem, series_axis: "list | range |
 
     names = problem["names"]; num_vars = problem["num_vars"]
     print(f"Saltelli samples (N={n_samples}, D={num_vars}) ...")
-    param_samples = sobol_sample.sample(problem, n_samples, calc_second_order=True)
+    param_samples = sobol_sample.sample(problem, n_samples, calc_second_order=True, seed=seed)
     n_ps = param_samples.shape[0]
     print(f"  {n_ps} parameter sets")
 
-    print(f"Simulating {n_ps} x {n_replicas} = {n_ps*n_replicas} runs ...")
-    all_ts = np.empty((n_ps, n_replicas, n_points))
-    base_rng = np.random.default_rng(seed)
-    for i in range(n_ps):
-        p = {name: param_samples[i,j] for j,name in enumerate(names)}
-        for r in range(n_replicas):
-            rng = np.random.default_rng(base_rng.integers(0, 2**31))
-            all_ts[i, r, :] = simulator_fn(p, series_axis, rng)
-        if (i+1) % max(1, n_ps//10) == 0:
-            print(f"  {i+1}/{n_ps}")
+    if precomputed_timeseries is not None:
+        print(f"Using precomputed timeseries {precomputed_timeseries.shape}")
+        all_ts = precomputed_timeseries
+    else:
+        print(f"Simulating {n_ps} x {n_replicas} = {n_ps*n_replicas} runs ...")
+        all_ts = np.empty((n_ps, n_replicas, n_points))
+        base_rng = np.random.default_rng(seed)
+        for i in range(n_ps):
+            p = {name: param_samples[i,j] for j,name in enumerate(names)}
+            for r in range(n_replicas):
+                rng = np.random.default_rng(base_rng.integers(0, 2**31))
+                all_ts[i, r, :] = simulator_fn(p, series_axis, rng)
+            if (i+1) % max(1, n_ps//10) == 0:
+                print(f"  {i+1}/{n_ps}")
 
     mean_ts = np.mean(all_ts, axis=1); var_ts = np.var(all_ts, axis=1)
     tv_mean = np.var(mean_ts, axis=0); tv_var = np.var(var_ts, axis=0)

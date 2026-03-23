@@ -53,10 +53,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 BBOX = (11.227499490547554, 46.11477985577746, 11.26659598835508, 46.145001069749725)
 
-# Edge index to observe. Set to None to auto-select the edge with the most
-# traffic in a reference run, or set to an integer (0-based row index in
-# edges_osm) to pick a specific road.
-EDGE_OF_INTEREST: int | None = None
+# Edge index to observe.
+EDGE_OF_INTEREST = 388
 
 # Time axis: occupancy is recorded at each of these steps.
 # Increase MAX_STEPS if many vehicles haven't arrived by step 500.
@@ -87,6 +85,9 @@ SA_PROBLEM = {
 N_SAMPLES  = 128    # Saltelli base N; total runs = N*(2*D+2) * n_replicas
 N_REPLICAS = 10     # stochastic replicas per parameter set (jittered start times)
 N_CORNER   = 20    # nodes near each corner used as origins / destinations
+SEED       = 42     # seed for Saltelli sampling and replica RNG
+
+RUNS_DIR   = os.path.join(OUT_DIR, "runs")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 1 — Load network
@@ -154,16 +155,6 @@ def corner_nodes(pos_proj, pos_ll, N_CORNER=20, plot=True, out_dir=None):
 
 
 nodes_bl, nodes_tr = corner_nodes(pos_proj, pos_ll, N_CORNER=N_CORNER, plot=True, out_dir=None)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Part 3 — Select edge of interest (if not set manually)
-# ═══════════════════════════════════════════════════════════════════════════
-
-EDGE_OF_INTEREST = 388
-
-# Pre-compute edge properties needed for occupancy
-_edge_length = float(edges_osm.iloc[EDGE_OF_INTEREST]["length"])
-_edge_lanes  = int(edges_osm.iloc[EDGE_OF_INTEREST]["lanes"])
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 4 — simulator_fn for the framework
@@ -254,14 +245,35 @@ def simulator_fn(
 # Part 5 — Run sensitivity analysis
 # ═══════════════════════════════════════════════════════════════════════════
 
+BUNDLE_NAME = f"N{N_SAMPLES}_R{N_REPLICAS}_seed{SEED}_edge{EDGE_OF_INTEREST}_steps{MAX_STEPS}"
+
+
 print("\n═══ Running sensitivity analysis ═══")
-results = run_sensitivity_analysis(
-    simulator_fn=simulator_fn,
-    problem=SA_PROBLEM,
-    series_axis=SERIES_AXIS,
-    n_samples=N_SAMPLES,
-    n_replicas=N_REPLICAS,
-)
+bundle_file = os.path.join(RUNS_DIR, f"{BUNDLE_NAME}.npz")
+if os.path.exists(bundle_file):
+    print(f"Loading cached bundle: {BUNDLE_NAME}")
+    cached = np.load(bundle_file)
+    results = run_sensitivity_analysis(
+        simulator_fn=simulator_fn,
+        problem=SA_PROBLEM,
+        series_axis=SERIES_AXIS,
+        n_samples=N_SAMPLES,
+        n_replicas=N_REPLICAS,
+        seed=SEED,
+        precomputed_timeseries=cached["timeseries"],
+    )
+else:
+    results = run_sensitivity_analysis(
+        simulator_fn=simulator_fn,
+        problem=SA_PROBLEM,
+        series_axis=SERIES_AXIS,
+        n_samples=N_SAMPLES,
+        n_replicas=N_REPLICAS,
+        seed=SEED,
+    )
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    np.savez_compressed(bundle_file, timeseries=results["timeseries"])
+    print(f"Saved bundle: {BUNDLE_NAME}")
 
 print_summary(results)
 
