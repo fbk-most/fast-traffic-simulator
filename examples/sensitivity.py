@@ -60,11 +60,11 @@ N_CORNER   = None    # nodes near each corner used as origins / destinations
 NODES_BL: list[int] | None = None  # e.g. [123456, 234567, 345678]
 NODES_TR: list[int] | None = None  # e.g. [456789, 567890]
 
-NODES_BL = [4, 126, 271, 261]
-NODES_TR = [160, 98, 157]
+NODES_BL = [4, 271, 270]
+NODES_TR = [159, 98, 157]
 
 # Edge index to observe.
-EDGE_OF_INTEREST = 606
+EDGE_OF_INTEREST = 606 # 606     27
 
 # Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
 RANDOM_PRIORITY = False
@@ -78,8 +78,7 @@ SERIES_AXIS = np.arange(MAX_STEPS)
 # Each entry is an interval in steps; None means no rerouting.
 REROUTE_POLICIES = [
     None,   # index 0: no rerouting
-    100,    # index 1: reroute every 100 steps (infrequent)
-    20,     # index 2: reroute every 20 steps  (frequent)
+    10,     # index 1: reroute every 10 steps  (frequent)
 ]
 N_REROUTE_POLICIES = len(REROUTE_POLICIES)
 
@@ -88,17 +87,19 @@ SA_PROBLEM = {
     "num_vars": 3,
     "names": ["demand", "od_seed", "reroute_policy"],
     "bounds": [
-        [250, 500],                # demand: total vehicles
+        [50, 500],                # demand: total vehicles
         [0, 1000],                 # od_seed: cast to int → selects one OD matrix
         [0, N_REROUTE_POLICIES],   # reroute_policy: continuous proxy → floor → discrete index
     ],
 }
 
-N_SAMPLES  = 1024    # Saltelli base N; total runs = N*(2*D+2) * n_replicas
+N_SAMPLES  = 2048    # Saltelli base N; total runs = N*(2*D+2) * n_replicas
 N_REPLICAS = 1      # stochastic replicas per parameter set (jittered start times)
 SEED       = 42     # seed for Saltelli sampling and replica RNG
 
 ANALYZE_VARIANCE = False  # set to True to compute Sobol indices for variance of the time series, in addition to the mean
+
+ROLLING_WINDOW = 40  # steps for rolling-average smoothing on exported occupancy curves (1 = no smoothing)
 
 RUNS_DIR   = os.path.join(OUT_DIR, "runs")
 
@@ -242,7 +243,11 @@ def simulator_fn_all_edges(
         update_routes = do_reroute and (t % reroute_interval == 0)
         sim.step(update_next_leg=update_routes)
 
-    return occ_buffer[series_axis]
+    result = occ_buffer[series_axis]
+    if ROLLING_WINDOW > 1:
+        kernel = np.ones(ROLLING_WINDOW) / ROLLING_WINDOW
+        result = np.apply_along_axis(lambda x: np.convolve(x, kernel, mode="same"), 0, result)
+    return result
 
 
 def simulator_fn(
@@ -322,5 +327,4 @@ print_summary(results)
 # ═══════════════════════════════════════════════════════════════════════════
 
 app = build_dash_app(results)
-print("\nStarting dashboard at http://127.0.0.1:8050/")
-app.run(debug=False)
+app.run(debug=False, port=9000)

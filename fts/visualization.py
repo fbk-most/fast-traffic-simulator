@@ -691,7 +691,7 @@ def plot_network(
     edge_trace = ctx.line(
         all_ex, all_ey,
         line=dict(width=edge_width, color=edge_color),
-        hoverinfo="skip", showlegend=False,
+        hoverinfo="skip", showlegend=True, name="edges",
     )
 
     edge_hover = ctx.scatter(

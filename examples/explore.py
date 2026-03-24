@@ -54,9 +54,9 @@ MAX_STEPS = 500
 SERIES_AXIS = np.arange(MAX_STEPS)
 
 ANIM_DELTA          = 5.0    # min following distance (m)
-ANIM_DEMAND         = 200     # number of vehicles
+ANIM_DEMAND         = 500     # number of vehicles
 ANIM_OD_SEED        = 42     # OD matrix seed
-ANIM_REROUTE_POLICY = 2      # 0=none, 1=every-100-steps, 2=every-20-steps
+ANIM_REROUTE_POLICY = 0      # 0=none, 1=every-100-steps, 2=every-20-steps
 ANIM_MAX_STEPS      = MAX_STEPS
 
 # Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
@@ -67,7 +67,7 @@ RANDOM_PRIORITY = False
 REROUTE_POLICIES = [
     None,   # index 0: no rerouting
     100,    # index 1: reroute every 100 steps (infrequent)
-    20,     # index 2: reroute every 20 steps  (frequent)
+    10,     # index 2: reroute every 20 steps  (frequent)
 ]
 
 N_CORNER   = 4    # nodes near each corner used as origins / destinations
@@ -77,8 +77,8 @@ N_CORNER   = 4    # nodes near each corner used as origins / destinations
 NODES_BL: list[int] | None = None  # e.g. [123456, 234567, 345678]
 NODES_TR: list[int] | None = None  # e.g. [456789, 567890]
 
-NODES_BL = [4, 126, 271, 261]
-NODES_TR = [160, 98, 157]
+NODES_BL = [4, 271, 270]
+NODES_TR = [159, 98, 157]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 1 — Load network
@@ -158,13 +158,13 @@ else:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Static network plot on map tiles
-fig_net_osm = plot_network(edges_osm, pos_latlon=pos_ll, highlight_nodes=[236,215,148,424,412,436,20,18])
+fig_net_osm = plot_network(edges_osm, pos_latlon=pos_ll, highlight_nodes=[4, 271, 270, 159, 98, 157])
 fig_net_osm.write_html(os.path.join(OUT_DIR, "map_network.html"))
 print(f"  -> {OUT_DIR}/map_network.html")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 6 — Concrete animation for a fixed parameter set
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════   
 # Visualise a single representative run so you can inspect vehicle movement
 # on the real OSMnx network.  Edit the parameters below to explore scenarios.
 
