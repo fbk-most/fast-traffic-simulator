@@ -27,8 +27,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/fbk-most/FastTrafficSimulator"
-Repository = "https://github.com/fbk-most/FastTrafficSimulator"
+Homepage = "https://github.com/fbk-most/fast-traffic-simulator"
+Repository = "https://github.com/fbk-most/fast-traffic-simulator"
 
 [build-system]
 requires = ["hatchling"]

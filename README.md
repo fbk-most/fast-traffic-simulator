@@ -27,8 +27,8 @@ pip install fast-traffic-simulator
 Or, for development (requires [uv](https://docs.astral.sh/uv/)):
 
 ```bash
-git clone https://github.com/fbk-most/FastTrafficSimulator
-cd FastTrafficSimulator
+git clone https://github.com/fbk-most/fast-traffic-simulator
+cd fast-traffic-simulator
 uv sync
 ```
 
