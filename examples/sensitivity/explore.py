@@ -39,24 +39,24 @@ import plotly.graph_objects as go
 from fts import Simulator
 from fts.visualization import animate_occupancy, compute_occupancy, from_osmnx, plot_edge_occupancy, plot_network, animate
 
-OUT_DIR = "examples/viz_output/michela"
+OUT_DIR = "examples/viz_output/small"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration — edit these to change the experiment
 # ═══════════════════════════════════════════════════════════════════════════
 
-BBOX = (11.227499490547554, 46.11477985577746, 11.26659598835508, 46.145001069749725)
+BBOX = (11.291501446145322, 46.46135129763713, 11.381263381846402, 46.512799873878805) # (west, south, east, north)
 
 # Time axis: occupancy is recorded at each of these steps.
 # Increase MAX_STEPS if many vehicles haven't arrived by step 500.
-MAX_STEPS = 500
+MAX_STEPS = 250
 SERIES_AXIS = np.arange(MAX_STEPS)
 
 ANIM_DELTA          = 5.0    # min following distance (m)
-ANIM_DEMAND         = 500     # number of vehicles
+ANIM_DEMAND         = 1000     # number of vehicles
 ANIM_OD_SEED        = 42     # OD matrix seed
-ANIM_REROUTE_POLICY = 0      # 0=none, 1=every-100-steps, 2=every-20-steps
+ANIM_REROUTE_POLICY = 1      # 0=none, 1=infrequent, 2=frequent
 ANIM_MAX_STEPS      = MAX_STEPS
 
 # Set to True to shuffle vehicle priority at each step (uses rng for reproducibility).
@@ -66,19 +66,20 @@ RANDOM_PRIORITY = False
 # Each entry is an interval in steps; None means no rerouting.
 REROUTE_POLICIES = [
     None,   # index 0: no rerouting
-    100,    # index 1: reroute every 100 steps (infrequent)
-    10,     # index 2: reroute every 20 steps  (frequent)
+    10      # index 1: reroute every 20 steps  (frequent)
 ]
 
-N_CORNER   = 4    # nodes near each corner used as origins / destinations
+N_CORNER   = None    # nodes near each corner used as origins / destinations
 
 # Optional: set explicit node lists to use as origins / destinations.
 # If None, the N_CORNER closest nodes to each corner are used instead.
 NODES_BL: list[int] | None = None  # e.g. [123456, 234567, 345678]
 NODES_TR: list[int] | None = None  # e.g. [456789, 567890]
 
-NODES_BL = [4, 271, 270]
-NODES_TR = [159, 98, 157]
+NODES_BL = np.arange(1000)  # example: all nodes with ID in [1, 159] as origins 
+NODES_TR = np.arange(1000)  # example: all nodes with ID in [1, 159] as origins 
+
+NUM_SHOW_VEH = 250
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 1 — Load network
@@ -234,6 +235,7 @@ _anim_fig = animate(
     lane_logs=_lane_logs,
     play_fps=10,
     tween=True,
+    vehicle_ids=np.arange(NUM_SHOW_VEH),
     edge_geometries=edge_geoms,
 )
 _anim_path = f"{OUT_DIR}/animation_delta{ANIM_DELTA}_demand{ANIM_DEMAND}_policy{ANIM_REROUTE_POLICY}.html"
