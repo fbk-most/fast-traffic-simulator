@@ -42,8 +42,10 @@ Nodes are treated as **dimensionless points**: travel time accrues only on
 links, and the transfer of a vehicle from an incoming edge to an outgoing edge
 is instantaneous.  In each time step, vehicles that have reached the end of an
 incoming edge and whose next edge (according to the current routing) has
-available inbound capacity are immediately transferred to that edge.  Vehicles
-that reach their destination node are removed from the network.
+available inbound capacity are immediately transferred to that edge.  Inbound
+capacity is evaluated once per step: lane space vacated during a step becomes
+available to entering vehicles only in the following step.  Vehicles that
+reach their destination node are removed from the network.
 
 Lane model
 ----------
@@ -393,8 +395,10 @@ class Simulator:
         3. **Arrived** — vehicles at their destination node transition to
            ``ARRIVED``.
         4. **Entering edge** — vehicles at a node attempt to enter the next
-           edge on their shortest path. The loop repeats until no more
-           vehicles can enter (handles multi-hop moves within one step).
+           edge on their shortest path. Admission is decided against the lane
+           state at the beginning of this phase: each lane with enough room
+           admits one vehicle, and lanes vacated during this same step become
+           available only in the next step.
         5. **Progress** — vehicles in edges advance by their edge speed, up
            to the front vehicle's position minus ``DELTA``.
 
@@ -473,82 +477,100 @@ class Simulator:
         do_arrived()
 
         def do_entering_edge() -> None:
-            while True:
-                # Find vehicles that should enter an edge
-                entering_edge = (self._vehicles.status == at_node_status)
-                if not np.any(entering_edge):
-                    break
-                # Compute the next node and edge.
-                # Note that from/to are inverted in _next_leg.
-                dest_rows = self._dest_row[self._vehicles.destination[entering_edge]]
-                assert (dest_rows >= 0).all()
-                next_nodes = next_leg[
-                    dest_rows,
-                    self._vehicles.node[entering_edge],
-                ]
+            # Find vehicles that should enter an edge.
+            # Note that from/to are inverted in _next_leg.
+            candidates = (self._vehicles.status == at_node_status).nonzero()[0]
+            if len(candidates) == 0:
+                return
+            dest_rows = self._dest_row[self._vehicles.destination[candidates]]
+            assert (dest_rows >= 0).all()
+            next_nodes = next_leg[
+                dest_rows,
+                self._vehicles.node[candidates],
+            ]
 
-                assert not (next_nodes == -9999).any()
+            assert not (next_nodes == -9999).any()
 
-                next_edges = self._edges_between(
-                    self._vehicles.node[entering_edge], next_nodes
-                )
+            next_edges = self._edges_between(
+                self._vehicles.node[candidates], next_nodes
+            )
 
-                # Get unique edges targeted by the vehicles, and the corresponding vehicles.
-                # Shuffling is performed for random simulations.
-                if self._random:
-                    order = np.arange(len(next_edges))
-                    self._rng.shuffle(order)
-                    unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
-                    unique_vehicles = order[unique_vehicles]
-                else:
-                    unique_edges, unique_vehicles = np.unique(next_edges, return_index=True)
+            # Priority among vehicles competing for the same edge: vehicle
+            # index order, or a random order for random simulations.
+            if self._random:
+                priority = self._rng.permutation(len(candidates))
+                candidates = candidates[priority]
+                next_nodes = next_nodes[priority]
+                next_edges = next_edges[priority]
 
-                # Restrict to edges that have at least one free lane
-                lane_distances = np.select(
-                    [
-                        self._edges.last_vehicle[unique_edges] == -1,
-                        self._edges.last_vehicle[unique_edges] < -1,
-                        True,
-                    ],
-                    [
-                        999_999.9,
-                        0.0,
-                        self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]],
-                    ],
-                )
-                free_edges = (lane_distances >= Simulator.DELTA).any(axis=1)
+            # Group the candidates by target edge, keeping the priority order
+            # within each group.
+            grouping = np.argsort(next_edges, kind='stable')
+            candidates = candidates[grouping]
+            next_nodes = next_nodes[grouping]
+            next_edges = next_edges[grouping]
+            unique_edges, group_start, group_size = np.unique(
+                next_edges, return_index=True, return_counts=True
+            )
 
-                if not free_edges.any():
-                    break
+            # Lane gaps as of the beginning of this phase: lanes vacated by
+            # vehicles moving on during this same step only become available
+            # in the next step.
+            lane_distances = np.select(
+                [
+                    self._edges.last_vehicle[unique_edges] == -1,
+                    self._edges.last_vehicle[unique_edges] < -1,
+                    True,
+                ],
+                [
+                    999_999.9,
+                    0.0,
+                    self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]],
+                ],
+            )
 
-                edges = unique_edges[free_edges]
-                lanes = np.argmax(lane_distances[free_edges], axis=1)
-                vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
-                assert not (self._edges.last_vehicle[edges, lanes] < -1).any()
+            # Each lane with a gap of at least DELTA admits exactly one
+            # vehicle (it enters at distance 0, leaving no room for another).
+            # Per edge, the first free_lanes[group] candidates in priority
+            # order are admitted, filling the qualifying lanes in
+            # decreasing-gap order (ties broken by lane index).
+            free_lanes = (lane_distances >= Simulator.DELTA).sum(axis=1)
+            group_id = np.repeat(np.arange(len(unique_edges)), group_size)
+            rank = np.arange(len(candidates)) - np.repeat(group_start, group_size)
+            admitted = rank < free_lanes[group_id]
 
-                # If a vehicle was last in its previous lane, mark that lane as empty
-                in_out_vehicles = (
-                    (self._vehicles.edge[vehicles] != -1) &
-                    (self._edges.last_vehicle[
-                        self._vehicles.edge[vehicles],
-                        self._vehicles.lane[vehicles],
-                    ] == vehicles)
-                )
-                self._edges.last_vehicle[
-                    self._vehicles.edge[vehicles[in_out_vehicles]],
-                    self._vehicles.lane[vehicles[in_out_vehicles]],
-                ] = -1
+            if not admitted.any():
+                return
 
-                # Transition to IN_EDGE and update all auxiliary fields
-                self._vehicles.status[vehicles] = in_edge_status
-                self._vehicles.entered_edge_now[vehicles] = True
-                self._vehicles.edge[vehicles] = edges
-                self._vehicles.lane[vehicles] = lanes
-                self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
-                self._vehicles.edge_distance[vehicles] = 0.0
-                self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
-                self._edges.last_vehicle[edges, lanes] = vehicles
-                self._edges.nr_vehicles[edges] += 1
+            vehicles = candidates[admitted]
+            edges = next_edges[admitted]
+            lane_order = np.argsort(-lane_distances, axis=1, kind='stable')
+            lanes = lane_order[group_id[admitted], rank[admitted]]
+            assert not (self._edges.last_vehicle[edges, lanes] < -1).any()
+
+            # If a vehicle was last in its previous lane, mark that lane as empty
+            in_out_vehicles = (
+                (self._vehicles.edge[vehicles] != -1) &
+                (self._edges.last_vehicle[
+                    self._vehicles.edge[vehicles],
+                    self._vehicles.lane[vehicles],
+                ] == vehicles)
+            )
+            self._edges.last_vehicle[
+                self._vehicles.edge[vehicles[in_out_vehicles]],
+                self._vehicles.lane[vehicles[in_out_vehicles]],
+            ] = -1
+
+            # Transition to IN_EDGE and update all auxiliary fields
+            self._vehicles.status[vehicles] = in_edge_status
+            self._vehicles.entered_edge_now[vehicles] = True
+            self._vehicles.edge[vehicles] = edges
+            self._vehicles.lane[vehicles] = lanes
+            self._vehicles.node[vehicles] = next_nodes[admitted]
+            self._vehicles.edge_distance[vehicles] = 0.0
+            self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
+            self._edges.last_vehicle[edges, lanes] = vehicles
+            np.add.at(self._edges.nr_vehicles, edges, 1)
 
         do_entering_edge()
 
