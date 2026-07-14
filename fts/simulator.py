@@ -15,9 +15,9 @@ Routing
 -------
 Routes are computed using **Dijkstra's shortest-path algorithm** with travel
 time (edge length divided by free-flow speed) as the edge weight.  The
-algorithm is run once at :meth:`Simulator.build` time over the full network,
-producing a predecessor matrix that encodes the next hop for every
-origin–destination pair.
+algorithm is run once at :meth:`Simulator.build` time, from every distinct
+vehicle destination, producing a predecessor matrix that encodes the next hop
+towards each destination from any node.
 
 Routes can be refreshed periodically during the simulation by calling
 ``step(update_next_leg=True)``.  In that case, instantaneous measured speeds
@@ -58,7 +58,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 import numpy as np
-from scipy.sparse import coo_array
+from scipy.sparse import csr_array
 from scipy.sparse.csgraph import dijkstra as shortest_path_search
 
 
@@ -234,15 +234,38 @@ class Simulator:
 
         self._max_lanes = self._edges.lanes.max()
 
-        n_nodes = int(max(edges['from'].max(), edges['to'].max())) + 1
-        self._nodes_to_edge_map = coo_array(
-            (range(self._nr_edges), (edges['from'], edges['to'])),
-            shape=(n_nodes, n_nodes),
-        ).toarray()
+        self._n_nodes = int(max(edges['from'].max(), edges['to'].max())) + 1
+
+        # Sorted-key lookup mapping a (from_node, to_node) pair to its edge
+        # index; O(nr_edges) memory instead of a dense nodes x nodes matrix.
+        keys = (
+            self._edges.from_node.astype(np.int64) * self._n_nodes
+            + self._edges.to_node
+        )
+        order = np.argsort(keys)
+        self._edge_lookup_keys = keys[order]
+        self._edge_lookup_values = order.astype(np.int32)
 
         self._next_leg: np.ndarray | None = None
+        # Row index into _next_leg for each destination node (-1 when the node
+        # is not a destination of any vehicle).
+        self._dest_row: np.ndarray | None = None
+        # Unique destination nodes: the Dijkstra sources (from/to inverted).
+        self._route_targets: np.ndarray | None = None
         self._ready = False
         self._now = 0
+
+    def _edges_between(self, from_nodes: np.ndarray, to_nodes: np.ndarray) -> np.ndarray:
+        """Return the edge index for each (from, to) node pair.
+
+        All requested pairs must correspond to existing edges (as is the case
+        for consecutive nodes on a shortest path).
+        """
+        keys = from_nodes.astype(np.int64) * self._n_nodes + to_nodes
+        pos = np.searchsorted(self._edge_lookup_keys, keys)
+        assert (pos < len(self._edge_lookup_keys)).all()
+        assert (self._edge_lookup_keys[pos] == keys).all()
+        return self._edge_lookup_values[pos]
 
     @classmethod
     def build(
@@ -295,18 +318,28 @@ class Simulator:
         # Compute the routing.
         # Note that from/to are inverted so that Dijkstra returns the *successor*
         # node on the path from each source to each destination.
-        n_nodes = simulator._nodes_to_edge_map.shape[0]
-        graph = coo_array(
+        # Dijkstra runs only from the nodes that are actual vehicle
+        # destinations, so _next_leg has one row per unique destination
+        # (indexed via _dest_row) instead of one row per node.
+        n_nodes = simulator._n_nodes
+        graph = csr_array(
             (edges['length'] / edges['speed'], (edges['to'], edges['from'])),
             shape=(n_nodes, n_nodes),
-        ).toarray()
-        _, simulator._next_leg = shortest_path_search(graph, return_predecessors=True)
+        )
+        simulator._route_targets = np.unique(simulator._vehicles.destination)
+        simulator._dest_row = np.full(n_nodes, -1, dtype=np.int32)
+        simulator._dest_row[simulator._route_targets] = np.arange(
+            len(simulator._route_targets), dtype=np.int32
+        )
+        _, simulator._next_leg = shortest_path_search(
+            graph, return_predecessors=True, indices=simulator._route_targets
+        )
 
         # Check for vehicles with unreachable destinations
         unreachable_mask = (
             (simulator._vehicles.destination != simulator._vehicles.origin) &
             (simulator._next_leg[
-                simulator._vehicles.destination,
+                simulator._dest_row[simulator._vehicles.destination],
                 simulator._vehicles.origin,
             ] == -9999)
         )
@@ -317,6 +350,9 @@ class Simulator:
                     f"{unreachable_mask.sum()} vehicle(s) have unreachable destinations. "
                     "Pass fix_unreachable=True to reroute them to their origin."
                 )
+            # The new destination may have no _dest_row entry, but these
+            # vehicles arrive at start (node == destination) without ever
+            # querying the routing.
             simulator._vehicles.destination[unreachable_mask] = (
                 simulator._vehicles.origin[unreachable_mask]
             )
@@ -444,15 +480,18 @@ class Simulator:
                     break
                 # Compute the next node and edge.
                 # Note that from/to are inverted in _next_leg.
+                dest_rows = self._dest_row[self._vehicles.destination[entering_edge]]
+                assert (dest_rows >= 0).all()
                 next_nodes = next_leg[
-                    self._vehicles.destination[entering_edge],
+                    dest_rows,
                     self._vehicles.node[entering_edge],
-                ]
-                next_edges = self._nodes_to_edge_map[
-                    self._vehicles.node[entering_edge], next_nodes
                 ]
 
                 assert not (next_nodes == -9999).any()
+
+                next_edges = self._edges_between(
+                    self._vehicles.node[entering_edge], next_nodes
+                )
 
                 # Get unique edges targeted by the vehicles, and the corresponding vehicles.
                 # Shuffling is performed for random simulations.
@@ -542,10 +581,13 @@ class Simulator:
                     np.add.at(instant_speed, step_edge, step)
                     unique_edge, count_edge = np.unique(step_edge, return_counts=True)
                     np.divide.at(instant_speed, unique_edge, count_edge)
-                    graph = coo_array(
-                        (self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node))
-                    ).toarray()
-                    _, self._next_leg = shortest_path_search(graph, return_predecessors=True)
+                    graph = csr_array(
+                        (self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node)),
+                        shape=(self._n_nodes, self._n_nodes),
+                    )
+                    _, self._next_leg = shortest_path_search(
+                        graph, return_predecessors=True, indices=self._route_targets
+                    )
 
                 do_update_next_leg()
 
