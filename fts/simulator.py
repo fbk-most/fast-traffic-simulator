@@ -186,7 +186,14 @@ class Simulator:
                 # -1: lane exists but is empty; -2: lane does not exist for this edge
                 self.last_vehicle[:, lane] = np.where(self.lanes > lane, -1, -2)
 
-    def __init__(self, edges, vehicles, *, random: bool = False) -> None:
+    def __init__(
+        self,
+        edges,
+        vehicles,
+        *,
+        random: bool = False,
+        seed: int | np.random.Generator | None = None,
+    ) -> None:
         """Store edge and vehicle data without computing routes.
 
         This constructor is intentionally lightweight. Call :meth:`build`
@@ -201,8 +208,13 @@ class Simulator:
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
+            seed: Seed (or ready-made :class:`numpy.random.Generator`) for the
+                shuffling performed when ``random=True``. Passing an integer
+                makes random runs reproducible. Defaults to ``None``
+                (fresh entropy on every run).
         """
         self._random = random
+        self._rng = np.random.default_rng(seed)
         self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
             origin=vehicles['origin'].values.astype(np.int32),
@@ -240,6 +252,7 @@ class Simulator:
         *,
         fix_unreachable: bool = False,
         random: bool = False,
+        seed: int | np.random.Generator | None = None,
     ) -> tuple['Simulator', list[int]]:
         """Construct a fully initialised simulator ready to run.
 
@@ -262,6 +275,10 @@ class Simulator:
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
+            seed: Seed (or ready-made :class:`numpy.random.Generator`) for the
+                shuffling performed when ``random=True``. Passing an integer
+                makes random runs reproducible. Defaults to ``None``
+                (fresh entropy on every run).
 
         Returns:
             A two-tuple ``(simulator, fixed)`` where *simulator* is ready to
@@ -273,7 +290,7 @@ class Simulator:
             ValueError: If ``fix_unreachable=False`` and one or more vehicles
                 have unreachable destinations.
         """
-        simulator = cls(edges, vehicles, random=random)
+        simulator = cls(edges, vehicles, random=random, seed=seed)
 
         # Compute the routing.
         # Note that from/to are inverted so that Dijkstra returns the *successor*
@@ -441,7 +458,7 @@ class Simulator:
                 # Shuffling is performed for random simulations.
                 if self._random:
                     order = np.arange(len(next_edges))
-                    np.random.shuffle(order)
+                    self._rng.shuffle(order)
                     unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
                     unique_vehicles = order[unique_vehicles]
                 else:
