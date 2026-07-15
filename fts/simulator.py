@@ -440,8 +440,11 @@ class Simulator:
         def do_starting() -> None:
             # Find vehicles that are ready to start: a contiguous slice of the
             # start-time-ordered vehicle indices.
+            # Search with matching dtype: passing Python ints would promote
+            # (and copy) the whole sorted array to int64 on every step.
             lo, hi = np.searchsorted(
-                self._sorted_start_times, [self._now, self._now + 1]
+                self._sorted_start_times,
+                np.array([self._now, self._now + 1], dtype=self._sorted_start_times.dtype),
             )
             starting = self._start_order[lo:hi]
             starting = starting[self._vehicles.status[starting] == waiting_status]
