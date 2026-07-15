@@ -395,7 +395,7 @@ class Simulator:
         """
         return self._edges
 
-    def step(self, update_next_leg: bool = False) -> None:
+    def step(self, update_next_leg: bool = False, horizon: int | None = None) -> None:
         """Advance the simulation by one time step.
 
         The method updates vehicle states in the following order:
@@ -419,6 +419,14 @@ class Simulator:
                 instantaneous measured speeds after updating vehicle positions.
                 This is expensive and is typically done only every few hundred
                 steps. Defaults to ``False``.
+            horizon: Upper bound, in steps, on the interval until the *next*
+                shortest-path recomputation. When given, only the routing rows
+                that can be read before then are recomputed: those of
+                destinations of vehicles currently in the network or departing
+                within ``horizon`` steps. This is much cheaper and produces
+                identical results, provided the caller does recompute at least
+                every ``horizon`` steps. Defaults to ``None`` (recompute all
+                rows). Only meaningful together with ``update_next_leg=True``.
         """
         if not self._ready:
             raise RuntimeError(
@@ -643,9 +651,37 @@ class Simulator:
                         (self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node)),
                         shape=(self._n_nodes, self._n_nodes),
                     )
-                    _, self._next_leg = shortest_path_search(
-                        graph, return_predecessors=True, indices=self._route_targets
+                    if horizon is None:
+                        _, self._next_leg = shortest_path_search(
+                            graph, return_predecessors=True, indices=self._route_targets
+                        )
+                        return
+                    # Restrict the recomputation to the routing rows that can
+                    # be read before the next recomputation: destinations of
+                    # vehicles in the network now or departing within horizon
+                    # steps. The remaining rows are recomputed again before
+                    # any vehicle reads them.
+                    lo, hi = np.searchsorted(
+                        self._sorted_start_times,
+                        np.array(
+                            [self._now, self._now + horizon],
+                            dtype=self._sorted_start_times.dtype,
+                        ),
+                        side='right',
                     )
+                    targets = np.unique(np.concatenate([
+                        self._vehicles.destination[self._active],
+                        self._vehicles.destination[self._start_order[lo:hi]],
+                    ]))
+                    # Drop destinations without a routing row (vehicles fixed
+                    # by fix_unreachable arrive at start and never route)
+                    targets = targets[self._dest_row[targets] >= 0]
+                    if len(targets) == 0:
+                        return
+                    _, predecessors = shortest_path_search(
+                        graph, return_predecessors=True, indices=targets
+                    )
+                    self._next_leg[self._dest_row[targets]] = predecessors
 
                 do_update_next_leg()
 

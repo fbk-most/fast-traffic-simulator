@@ -221,8 +221,8 @@ def main() -> None:
     h = 0
     while True:
         for s in range(60 * 60):
-            simulator.step(s % SP == SP - 1)
             abs_step = h * 3600 + s
+            simulator.step(abs_step % SP == SP - 1, horizon=SP)
 
             if record_volume and s % 300 == 299:
                 volume_logs.append(pd.DataFrame({
