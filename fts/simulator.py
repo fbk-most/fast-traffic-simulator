@@ -22,7 +22,12 @@ towards each destination from any node.
 Routes can be refreshed periodically during the simulation by calling
 ``step(update_next_leg=True)``.  In that case, instantaneous measured speeds
 (derived from vehicle displacements in the current step) are substituted for
-free-flow speeds, so the updated paths reflect current congestion.
+free-flow speeds, so the updated paths reflect current congestion.  When the
+caller commits to a maximum refresh interval (the ``horizon`` argument), the
+recomputation is restricted to the destinations whose routing can actually be
+read before the next refresh, which is considerably cheaper and produces
+identical results; a :exc:`RuntimeError` is raised if the promised refresh
+does not happen in time.
 
 Vehicle-following model (links)
 --------------------------------
@@ -266,8 +271,33 @@ class Simulator:
         self._dest_row: np.ndarray | None = None
         # Unique destination nodes: the Dijkstra sources (from/to inverted).
         self._route_targets: np.ndarray | None = None
+        # Last step for which _next_leg is guaranteed fresh. Bounded only by
+        # horizon-limited refreshes; see step(horizon=...).
+        self._route_valid_until = Simulator.END_OF_TIME
         self._ready = False
         self._now = 0
+
+    def _shortest_paths_to(self, targets: np.ndarray, travel_time) -> np.ndarray:
+        """Compute next-hop predecessor rows towards each target node.
+
+        Note that from/to are inverted so that Dijkstra, run from each target,
+        returns the *successor* node on the path from any node to that target.
+
+        Args:
+            targets: Destination node indices (the Dijkstra sources).
+            travel_time: Per-edge travel time to use as the edge weight.
+
+        Returns:
+            Predecessor matrix of shape ``(len(targets), nr_nodes)``.
+        """
+        graph = csr_array(
+            (travel_time, (self._edges.to_node, self._edges.from_node)),
+            shape=(self._n_nodes, self._n_nodes),
+        )
+        _, predecessors = shortest_path_search(
+            graph, return_predecessors=True, indices=targets
+        )
+        return predecessors
 
     def _edges_between(self, from_nodes: np.ndarray, to_nodes: np.ndarray) -> np.ndarray:
         """Return the edge index for each (from, to) node pair.
@@ -329,24 +359,19 @@ class Simulator:
         """
         simulator = cls(edges, vehicles, random=random, seed=seed)
 
-        # Compute the routing.
-        # Note that from/to are inverted so that Dijkstra returns the *successor*
-        # node on the path from each source to each destination.
-        # Dijkstra runs only from the nodes that are actual vehicle
-        # destinations, so _next_leg has one row per unique destination
-        # (indexed via _dest_row) instead of one row per node.
-        n_nodes = simulator._n_nodes
-        graph = csr_array(
-            (edges['length'] / edges['speed'], (edges['to'], edges['from'])),
-            shape=(n_nodes, n_nodes),
-        )
+        # Compute the routing with free-flow speeds. Dijkstra runs only from
+        # the nodes that are actual vehicle destinations, so _next_leg has one
+        # row per unique destination (indexed via _dest_row) instead of one
+        # row per node. All destination rows are needed here (not only those
+        # within some departure horizon) because the reachability check below
+        # inspects every vehicle regardless of its start time.
         simulator._route_targets = np.unique(simulator._vehicles.destination)
-        simulator._dest_row = np.full(n_nodes, -1, dtype=np.int32)
+        simulator._dest_row = np.full(simulator._n_nodes, -1, dtype=np.int32)
         simulator._dest_row[simulator._route_targets] = np.arange(
             len(simulator._route_targets), dtype=np.int32
         )
-        _, simulator._next_leg = shortest_path_search(
-            graph, return_predecessors=True, indices=simulator._route_targets
+        simulator._next_leg = simulator._shortest_paths_to(
+            simulator._route_targets, edges['length'] / edges['speed']
         )
 
         # Check for vehicles with unreachable destinations
@@ -427,6 +452,11 @@ class Simulator:
                 identical results, provided the caller does recompute at least
                 every ``horizon`` steps. Defaults to ``None`` (recompute all
                 rows). Only meaningful together with ``update_next_leg=True``.
+
+        Raises:
+            RuntimeError: If the simulator was not built with :meth:`build`,
+                or if routing data is read after a promised ``horizon`` has
+                elapsed without the corresponding recomputation.
         """
         if not self._ready:
             raise RuntimeError(
@@ -523,6 +553,14 @@ class Simulator:
             ]
             if len(candidates) == 0:
                 return
+            if self._now > self._route_valid_until:
+                raise RuntimeError(
+                    "Routing data may be stale: the last shortest-path "
+                    f"recomputation promised a refresh within its horizon "
+                    f"(by step {self._route_valid_until}), but none happened "
+                    f"by step {self._now}. Call step(update_next_leg=True) "
+                    "at least every `horizon` steps, or pass horizon=None."
+                )
             dest_rows = self._dest_row[self._vehicles.destination[candidates]]
             assert (dest_rows >= 0).all()
             next_nodes = next_leg[
@@ -647,14 +685,12 @@ class Simulator:
                     np.add.at(instant_speed, step_edge, step)
                     unique_edge, count_edge = np.unique(step_edge, return_counts=True)
                     np.divide.at(instant_speed, unique_edge, count_edge)
-                    graph = csr_array(
-                        (self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node)),
-                        shape=(self._n_nodes, self._n_nodes),
-                    )
+                    travel_time = self._edges.length / instant_speed
                     if horizon is None:
-                        _, self._next_leg = shortest_path_search(
-                            graph, return_predecessors=True, indices=self._route_targets
+                        self._next_leg = self._shortest_paths_to(
+                            self._route_targets, travel_time
                         )
+                        self._route_valid_until = Simulator.END_OF_TIME
                         return
                     # Restrict the recomputation to the routing rows that can
                     # be read before the next recomputation: destinations of
@@ -676,12 +712,12 @@ class Simulator:
                     # Drop destinations without a routing row (vehicles fixed
                     # by fix_unreachable arrive at start and never route)
                     targets = targets[self._dest_row[targets] >= 0]
+                    self._route_valid_until = self._now + horizon
                     if len(targets) == 0:
                         return
-                    _, predecessors = shortest_path_search(
-                        graph, return_predecessors=True, indices=targets
+                    self._next_leg[self._dest_row[targets]] = (
+                        self._shortest_paths_to(targets, travel_time)
                     )
-                    self._next_leg[self._dest_row[targets]] = predecessors
 
                 do_update_next_leg()
 
