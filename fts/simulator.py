@@ -111,7 +111,7 @@ class Simulator:
             start_time: Simulation time step at which each vehicle departs.
 
         Attributes:
-            status: Current :class:`VehicleStatus` value (stored as ``int32``).
+            status: Current :class:`VehicleStatus` value (stored as ``int8``).
             node: Current node index for each vehicle.
             edge: Current edge index (``-1`` when not in an edge).
             lane: Current lane index within the edge (``-1`` when not in an edge).
@@ -144,7 +144,7 @@ class Simulator:
 
         def __post_init__(self) -> None:
             nr_vehicles = self.origin.shape[0]
-            self.status = np.full(nr_vehicles, Simulator.VehicleStatus.WAITING.value, dtype=np.int32)
+            self.status = np.full(nr_vehicles, Simulator.VehicleStatus.WAITING.value, dtype=np.int8)
             self.node = self.origin.copy()
             self.edge = np.full(nr_vehicles, -1, dtype=np.int32)
             self.lane = np.full(nr_vehicles, -1, dtype=np.int32)
@@ -247,6 +247,18 @@ class Simulator:
         order = np.argsort(keys)
         self._edge_lookup_keys = keys[order]
         self._edge_lookup_values = order.astype(np.int32)
+
+        # Vehicle indices ordered by start time, so that the vehicles starting
+        # at a given step form a contiguous slice found by bisection.
+        self._start_order = np.argsort(
+            self._vehicles.start_time, kind='stable'
+        ).astype(np.int32)
+        self._sorted_start_times = self._vehicles.start_time[self._start_order]
+
+        # Sorted indices of the vehicles currently in the network (AT_NODE or
+        # IN_EDGE): per-step work scales with this set, not with the total
+        # number of vehicles.
+        self._active = np.empty(0, dtype=np.int32)
 
         self._next_leg: np.ndarray | None = None
         # Row index into _next_leg for each destination node (-1 when the node
@@ -426,60 +438,78 @@ class Simulator:
         self._vehicles.entered_edge_now[:] = False
 
         def do_starting() -> None:
-            # Find vehicles that are ready to start
-            starting = (self._vehicles.start_time == self._now) & (self._vehicles.status == waiting_status)
-            if np.any(starting):
+            # Find vehicles that are ready to start: a contiguous slice of the
+            # start-time-ordered vehicle indices.
+            lo, hi = np.searchsorted(
+                self._sorted_start_times, [self._now, self._now + 1]
+            )
+            starting = self._start_order[lo:hi]
+            starting = starting[self._vehicles.status[starting] == waiting_status]
+            if len(starting) > 0:
                 self._vehicles.status[starting] = at_node_status
                 self._vehicles.started_now[starting] = True
+                # Merge into the sorted active-vehicle set
+                starting = np.sort(starting)
+                self._active = np.insert(
+                    self._active, np.searchsorted(self._active, starting), starting
+                )
 
         do_starting()
 
         def do_out_of_edge() -> None:
             # Find vehicles that have reached the end of their edge
-            vehicles = (
-                (self._vehicles.status == in_edge_status) &
-                (self._vehicles.edge_distance == self._edges.length[self._vehicles.edge])
-            )
+            active = self._active
+            in_edge_v = active[self._vehicles.status[active] == in_edge_status]
+            vehicles = in_edge_v[
+                self._vehicles.edge_distance[in_edge_v]
+                == self._edges.length[self._vehicles.edge[in_edge_v]]
+            ]
             self._vehicles.status[vehicles] = at_node_status
 
         do_out_of_edge()
 
         def do_arrived() -> None:
             # Find vehicles that reached their final destination
-            arrived = (
-                (self._vehicles.status == at_node_status) &
-                (self._vehicles.node == self._vehicles.destination)
-            )
-            if np.any(arrived):
+            active = self._active
+            at_node_v = active[self._vehicles.status[active] == at_node_status]
+            arrived = at_node_v[
+                self._vehicles.node[at_node_v] == self._vehicles.destination[at_node_v]
+            ]
+            if len(arrived) > 0:
                 self._vehicles.status[arrived] = arrived_status
                 self._vehicles.arrival_time[arrived] = self._now
                 self._vehicles.arrived_now[arrived] = True
 
                 # Restrict to vehicles that did not start right away (origin == destination)
-                arrived_not_started = arrived & (self._vehicles.edge >= 0)
+                arrived_not_started = arrived[self._vehicles.edge[arrived] >= 0]
                 # Restrict to vehicles that are last in their lane
-                in_out_vehicles = (
+                in_out_vehicles = arrived_not_started[
                     self._edges.last_vehicle[
                         self._vehicles.edge[arrived_not_started],
                         self._vehicles.lane[arrived_not_started],
-                    ] == arrived_not_started.nonzero()[0]
-                )
-                in_out_vehicles = arrived_not_started.nonzero()[0][in_out_vehicles]
+                    ] == arrived_not_started
+                ]
                 # Mark those lanes as empty
                 self._edges.last_vehicle[
                     self._vehicles.edge[in_out_vehicles],
                     self._vehicles.lane[in_out_vehicles],
                 ] = -1
-                # Reset edge and lane for arrived vehicles
+                # Reset edge, lane and front pointer for arrived vehicles
                 self._vehicles.edge[arrived_not_started] = -1
                 self._vehicles.lane[arrived_not_started] = -1
+                self._vehicles.lane_front_vehicle[arrived_not_started] = -1
+                # Arrived vehicles leave the active set
+                self._active = active[self._vehicles.status[active] != arrived_status]
 
         do_arrived()
 
         def do_entering_edge() -> None:
-            # Find vehicles that should enter an edge.
+            # Find vehicles that should enter an edge (_active is sorted, so
+            # candidates are in ascending vehicle-index order).
             # Note that from/to are inverted in _next_leg.
-            candidates = (self._vehicles.status == at_node_status).nonzero()[0]
+            candidates = self._active[
+                self._vehicles.status[self._active] == at_node_status
+            ]
             if len(candidates) == 0:
                 return
             dest_rows = self._dest_row[self._vehicles.destination[candidates]]
@@ -575,16 +605,19 @@ class Simulator:
         do_entering_edge()
 
         def do_progress_vehicles() -> None:
+            active = self._active
             # Clear stale front-vehicle references (front vehicle has changed edge)
-            new_edge_front = (
-                (self._vehicles.lane_front_vehicle != -1) &
-                (self._vehicles.edge != self._vehicles.edge[self._vehicles.lane_front_vehicle])
-            )
+            front_ref = self._vehicles.lane_front_vehicle[active]
+            new_edge_front = active[
+                (front_ref != -1) &
+                (self._vehicles.edge[active] != self._vehicles.edge[front_ref])
+            ]
             self._vehicles.lane_front_vehicle[new_edge_front] = -1
 
-            in_edge = (self._vehicles.status == in_edge_status)
-            in_edge_front = in_edge & (self._vehicles.lane_front_vehicle == -1)
-            in_edge_follow = in_edge & ~in_edge_front
+            in_edge_v = active[self._vehicles.status[active] == in_edge_status]
+            front_of_lane = self._vehicles.lane_front_vehicle[in_edge_v] == -1
+            in_edge_front = in_edge_v[front_of_lane]
+            in_edge_follow = in_edge_v[~front_of_lane]
 
             # Following vehicles advance up to (front vehicle position - DELTA)
             new_distance = np.minimum(
@@ -624,6 +657,6 @@ class Simulator:
 
         do_progress_vehicles()
 
-        assert not (self._vehicles.edge_distance < 0.0).any()
+        assert not (self._vehicles.edge_distance[self._active] < 0.0).any()
 
         self._now += 1
