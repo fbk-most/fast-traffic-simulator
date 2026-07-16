@@ -150,6 +150,11 @@ def main() -> None:
         help="Shortest-path recomputation interval in steps",
     )
     parser.add_argument(
+        '--workers', type=int, metavar='N',
+        help="Worker processes for parallel shortest-path recomputation "
+             "(default: single-process)",
+    )
+    parser.add_argument(
         '--max-vehicles', type=int, metavar='N',
         help="Limit simulation to the first N vehicles",
     )
@@ -195,6 +200,7 @@ def main() -> None:
     simulator, fixed = Simulator.build(
         edges=converted_edges, vehicles=converted_vehicles,
         fix_unreachable=True, random=args.random, seed=args.seed,
+        refresh_interval=args.sp, refresh_workers=args.workers,
     )
     if fixed:
         print(f"*** Rerouting {len(fixed)} vehicles with unreachable destinations ***")
@@ -208,7 +214,6 @@ def main() -> None:
     # Run simulation
     print(f"Starting simulation (random={args.random}, SP recomputation every {args.sp} steps)...")
     start_sim = time.time()
-    SP = args.sp
     volume_logs: list[pd.DataFrame] = []
     # Per-step event batches: (step, vehicle_indices, event_kind, edge_index).
     # Kinds: 0 = waiting_at_origin_node, 1 = entered edge, 2 = trip_end.
@@ -222,7 +227,7 @@ def main() -> None:
     while True:
         for s in range(60 * 60):
             abs_step = h * 3600 + s
-            simulator.step(abs_step % SP == SP - 1, horizon=SP)
+            simulator.step()
 
             if record_volume and s % 300 == 299:
                 volume_logs.append(pd.DataFrame({
@@ -261,6 +266,8 @@ def main() -> None:
 
         if nr_waiting + nr_at_node + nr_in_edge == 0:
             break
+
+    simulator.close()
 
     # Write outputs
     if record_volume:

@@ -9,9 +9,6 @@ We need to manage:
 
 Improvements:
 
-- automated shortest-path refresh: let the simulator trigger (and possibly parallelize) the Dijkstra recomputation
-  itself instead of trusting the caller's `horizon` contract; this would also allow computing the refresh in a
-  background thread.
 - event-driven stepping core (deferred): positions of unobstructed vehicles are closed-form, so per-step work could
   scale with state *changes* rather than in-flight vehicles; modest payoff now that stepping is a minor share of the
   runtime.
@@ -22,3 +19,5 @@ Done:
 
 - ~~no need to manage the whole vehicle array in all iterations: we can consider windows of active vehicles~~
   (active-vehicle index set, 2026-07)
+- ~~automated shortest-path refresh, possibly parallelized~~ (`refresh_interval`/`refresh_workers` build parameters,
+  2026-07; note: scipy's Dijkstra holds the GIL, so parallelism uses worker processes, not threads)

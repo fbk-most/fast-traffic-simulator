@@ -29,6 +29,12 @@ read before the next refresh, which is considerably cheaper and produces
 identical results; a :exc:`RuntimeError` is raised if the promised refresh
 does not happen in time.
 
+Refreshes can also be automated and parallelised: building the simulator with
+``refresh_interval`` makes :meth:`Simulator.step` trigger the recomputation
+itself on a fixed cadence, and ``refresh_workers`` distributes it over a pool
+of worker processes (with identical results, since each destination's
+shortest-path tree is computed independently).
+
 Vehicle-following model (links)
 --------------------------------
 Vehicle dynamics on links follow **Newell's simplified car-following model**.
@@ -61,12 +67,37 @@ the most available space (largest gap to the current rear vehicle); it remains
 in that lane until it exits the edge.
 """
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 import numpy as np
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import dijkstra as shortest_path_search
+
+# Static network data of the worker processes used for parallel shortest-path
+# computation; populated once per worker by _refresh_pool_initializer.
+_pool_network: dict = {}
+
+
+def _refresh_pool_initializer(to_node: np.ndarray, from_node: np.ndarray, n_nodes: int) -> None:
+    _pool_network['to_node'] = to_node
+    _pool_network['from_node'] = from_node
+    _pool_network['n_nodes'] = n_nodes
+
+
+def _refresh_pool_worker(args: tuple) -> np.ndarray:
+    """Compute predecessor rows for a chunk of target nodes."""
+    travel_time, targets = args
+    n_nodes = _pool_network['n_nodes']
+    graph = csr_array(
+        (travel_time, (_pool_network['to_node'], _pool_network['from_node'])),
+        shape=(n_nodes, n_nodes),
+    )
+    _, predecessors = shortest_path_search(
+        graph, return_predecessors=True, indices=targets
+    )
+    return predecessors
 
 
 class Simulator:
@@ -200,6 +231,8 @@ class Simulator:
         *,
         random: bool = False,
         seed: int | np.random.Generator | None = None,
+        refresh_interval: int | None = None,
+        refresh_workers: int | None = None,
     ) -> None:
         """Store edge and vehicle data without computing routes.
 
@@ -219,9 +252,23 @@ class Simulator:
                 shuffling performed when ``random=True``. Passing an integer
                 makes random runs reproducible. Defaults to ``None``
                 (fresh entropy on every run).
+            refresh_interval: If set, :meth:`step` triggers the shortest-path
+                recomputation automatically every ``refresh_interval`` steps
+                (with the matching horizon), so callers no longer need to pass
+                ``update_next_leg``/``horizon``. Defaults to ``None`` (caller
+                -driven refreshes only).
+            refresh_workers: If set to 2 or more, shortest-path recomputations
+                are distributed over a persistent pool of that many worker
+                processes. Results are identical to the single-process
+                computation. Defaults to ``None`` (compute in-process).
         """
         self._random = random
         self._rng = np.random.default_rng(seed)
+        if refresh_interval is not None and refresh_interval < 1:
+            raise ValueError("refresh_interval must be a positive number of steps")
+        self._refresh_interval = refresh_interval
+        self._refresh_workers = refresh_workers
+        self._refresh_pool: ProcessPoolExecutor | None = None
         self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
             origin=vehicles['origin'].values.astype(np.int32),
@@ -283,6 +330,10 @@ class Simulator:
         Note that from/to are inverted so that Dijkstra, run from each target,
         returns the *successor* node on the path from any node to that target.
 
+        When ``refresh_workers`` is configured, the targets are split over a
+        persistent pool of worker processes; each target's computation is
+        independent, so the result is identical to the in-process one.
+
         Args:
             targets: Destination node indices (the Dijkstra sources).
             travel_time: Per-edge travel time to use as the edge weight.
@@ -290,6 +341,21 @@ class Simulator:
         Returns:
             Predecessor matrix of shape ``(len(targets), nr_nodes)``.
         """
+        workers = self._refresh_workers
+        if workers is not None and workers > 1 and len(targets) > 1:
+            if self._refresh_pool is None:
+                self._refresh_pool = ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_refresh_pool_initializer,
+                    initargs=(self._edges.to_node, self._edges.from_node, self._n_nodes),
+                )
+            travel_time = np.asarray(travel_time)
+            chunks = [c for c in np.array_split(targets, workers) if len(c) > 0]
+            predecessors = self._refresh_pool.map(
+                _refresh_pool_worker, [(travel_time, c) for c in chunks]
+            )
+            return np.vstack(list(predecessors))
+
         graph = csr_array(
             (travel_time, (self._edges.to_node, self._edges.from_node)),
             shape=(self._n_nodes, self._n_nodes),
@@ -298,6 +364,23 @@ class Simulator:
             graph, return_predecessors=True, indices=targets
         )
         return predecessors
+
+    def close(self) -> None:
+        """Release resources held by the simulator.
+
+        Shuts down the worker-process pool used for parallel shortest-path
+        recomputation, if one was started. The simulator remains usable; a
+        new pool is started on demand.
+        """
+        if self._refresh_pool is not None:
+            self._refresh_pool.shutdown()
+            self._refresh_pool = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _edges_between(self, from_nodes: np.ndarray, to_nodes: np.ndarray) -> np.ndarray:
         """Return the edge index for each (from, to) node pair.
@@ -320,6 +403,8 @@ class Simulator:
         fix_unreachable: bool = False,
         random: bool = False,
         seed: int | np.random.Generator | None = None,
+        refresh_interval: int | None = None,
+        refresh_workers: int | None = None,
     ) -> tuple['Simulator', list[int]]:
         """Construct a fully initialised simulator ready to run.
 
@@ -346,6 +431,15 @@ class Simulator:
                 shuffling performed when ``random=True``. Passing an integer
                 makes random runs reproducible. Defaults to ``None``
                 (fresh entropy on every run).
+            refresh_interval: If set, :meth:`step` triggers the shortest-path
+                recomputation automatically every ``refresh_interval`` steps
+                (with the matching horizon), so callers no longer need to pass
+                ``update_next_leg``/``horizon``. Defaults to ``None`` (caller
+                -driven refreshes only).
+            refresh_workers: If set to 2 or more, shortest-path recomputations
+                are distributed over a persistent pool of that many worker
+                processes. Results are identical to the single-process
+                computation. Defaults to ``None`` (compute in-process).
 
         Returns:
             A two-tuple ``(simulator, fixed)`` where *simulator* is ready to
@@ -357,7 +451,10 @@ class Simulator:
             ValueError: If ``fix_unreachable=False`` and one or more vehicles
                 have unreachable destinations.
         """
-        simulator = cls(edges, vehicles, random=random, seed=seed)
+        simulator = cls(
+            edges, vehicles, random=random, seed=seed,
+            refresh_interval=refresh_interval, refresh_workers=refresh_workers,
+        )
 
         # Compute the routing with free-flow speeds. Dijkstra runs only from
         # the nodes that are actual vehicle destinations, so _next_leg has one
@@ -439,6 +536,10 @@ class Simulator:
         5. **Progress** — vehicles in edges advance by their edge speed, up
            to the front vehicle's position minus ``DELTA``.
 
+        When the simulator was built with ``refresh_interval``, the
+        shortest-path recomputation is triggered automatically every
+        ``refresh_interval`` steps and these arguments are not needed.
+
         Args:
             update_next_leg: If ``True``, recompute shortest paths using
                 instantaneous measured speeds after updating vehicle positions.
@@ -465,6 +566,15 @@ class Simulator:
             )
         assert self._next_leg is not None
         next_leg: np.ndarray = self._next_leg
+
+        # Automatic refresh: same cadence and semantics as a caller passing
+        # update_next_leg=True with horizon=refresh_interval every
+        # refresh_interval steps. An explicit update_next_leg call keeps its
+        # own horizon.
+        if not update_next_leg and self._refresh_interval is not None:
+            if (self._now + 1) % self._refresh_interval == 0:
+                update_next_leg = True
+                horizon = self._refresh_interval
 
         waiting_status = Simulator.VehicleStatus.WAITING.value
         at_node_status = Simulator.VehicleStatus.AT_NODE.value
