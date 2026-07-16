@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structures, destination-restricted Dijkstra, active-vehicle tracking,
   vectorized admission and trip logging).
 
-## [0.1.1] - 2025-04-20
+## [0.1.1] - 2026-04-20
 
 ### Fixed
 
