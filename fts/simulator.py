@@ -15,14 +15,25 @@ Routing
 -------
 Routes are computed using **Dijkstra's shortest-path algorithm** with travel
 time (edge length divided by free-flow speed) as the edge weight.  The
-algorithm is run once at :meth:`Simulator.build` time over the full network,
-producing a predecessor matrix that encodes the next hop for every
-origin–destination pair.
+algorithm is run once at :meth:`Simulator.build` time, from every distinct
+vehicle destination, producing a predecessor matrix that encodes the next hop
+towards each destination from any node.
 
 Routes can be refreshed periodically during the simulation by calling
 ``step(update_next_leg=True)``.  In that case, instantaneous measured speeds
 (derived from vehicle displacements in the current step) are substituted for
-free-flow speeds, so the updated paths reflect current congestion.
+free-flow speeds, so the updated paths reflect current congestion.  When the
+caller commits to a maximum refresh interval (the ``horizon`` argument), the
+recomputation is restricted to the destinations whose routing can actually be
+read before the next refresh, which is considerably cheaper and produces
+identical results; a :exc:`RuntimeError` is raised if the promised refresh
+does not happen in time.
+
+Refreshes can also be automated and parallelised: building the simulator with
+``refresh_interval`` makes :meth:`Simulator.step` trigger the recomputation
+itself on a fixed cadence, and ``refresh_workers`` distributes it over a pool
+of worker processes (with identical results, since each destination's
+shortest-path tree is computed independently).
 
 Vehicle-following model (links)
 --------------------------------
@@ -42,8 +53,10 @@ Nodes are treated as **dimensionless points**: travel time accrues only on
 links, and the transfer of a vehicle from an incoming edge to an outgoing edge
 is instantaneous.  In each time step, vehicles that have reached the end of an
 incoming edge and whose next edge (according to the current routing) has
-available inbound capacity are immediately transferred to that edge.  Vehicles
-that reach their destination node are removed from the network.
+available inbound capacity are immediately transferred to that edge.  Inbound
+capacity is evaluated once per step: lane space vacated during a step becomes
+available to entering vehicles only in the following step.  Vehicles that
+reach their destination node are removed from the network.
 
 Lane model
 ----------
@@ -54,12 +67,37 @@ the most available space (largest gap to the current rear vehicle); it remains
 in that lane until it exits the edge.
 """
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
 import numpy as np
-from scipy.sparse import coo_array
+from scipy.sparse import csr_array
 from scipy.sparse.csgraph import dijkstra as shortest_path_search
+
+# Static network data of the worker processes used for parallel shortest-path
+# computation; populated once per worker by _refresh_pool_initializer.
+_pool_network: dict = {}
+
+
+def _refresh_pool_initializer(to_node: np.ndarray, from_node: np.ndarray, n_nodes: int) -> None:
+    _pool_network['to_node'] = to_node
+    _pool_network['from_node'] = from_node
+    _pool_network['n_nodes'] = n_nodes
+
+
+def _refresh_pool_worker(args: tuple) -> np.ndarray:
+    """Compute predecessor rows for a chunk of target nodes."""
+    travel_time, targets = args
+    n_nodes = _pool_network['n_nodes']
+    graph = csr_array(
+        (travel_time, (_pool_network['to_node'], _pool_network['from_node'])),
+        shape=(n_nodes, n_nodes),
+    )
+    _, predecessors = shortest_path_search(
+        graph, return_predecessors=True, indices=targets
+    )
+    return predecessors
 
 
 class Simulator:
@@ -109,7 +147,7 @@ class Simulator:
             start_time: Simulation time step at which each vehicle departs.
 
         Attributes:
-            status: Current :class:`VehicleStatus` value (stored as ``int32``).
+            status: Current :class:`VehicleStatus` value (stored as ``int8``).
             node: Current node index for each vehicle.
             edge: Current edge index (``-1`` when not in an edge).
             lane: Current lane index within the edge (``-1`` when not in an edge).
@@ -142,7 +180,7 @@ class Simulator:
 
         def __post_init__(self) -> None:
             nr_vehicles = self.origin.shape[0]
-            self.status = np.full(nr_vehicles, Simulator.VehicleStatus.WAITING.value, dtype=np.int32)
+            self.status = np.full(nr_vehicles, Simulator.VehicleStatus.WAITING.value, dtype=np.int8)
             self.node = self.origin.copy()
             self.edge = np.full(nr_vehicles, -1, dtype=np.int32)
             self.lane = np.full(nr_vehicles, -1, dtype=np.int32)
@@ -186,7 +224,16 @@ class Simulator:
                 # -1: lane exists but is empty; -2: lane does not exist for this edge
                 self.last_vehicle[:, lane] = np.where(self.lanes > lane, -1, -2)
 
-    def __init__(self, edges, vehicles, *, random: bool = False) -> None:
+    def __init__(
+        self,
+        edges,
+        vehicles,
+        *,
+        random: bool = False,
+        seed: int | np.random.Generator | None = None,
+        refresh_interval: int | None = None,
+        refresh_workers: int | None = None,
+    ) -> None:
         """Store edge and vehicle data without computing routes.
 
         This constructor is intentionally lightweight. Call :meth:`build`
@@ -201,8 +248,27 @@ class Simulator:
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
+            seed: Seed (or ready-made :class:`numpy.random.Generator`) for the
+                shuffling performed when ``random=True``. Passing an integer
+                makes random runs reproducible. Defaults to ``None``
+                (fresh entropy on every run).
+            refresh_interval: If set, :meth:`step` triggers the shortest-path
+                recomputation automatically every ``refresh_interval`` steps
+                (with the matching horizon), so callers no longer need to pass
+                ``update_next_leg``/``horizon``. Defaults to ``None`` (caller
+                -driven refreshes only).
+            refresh_workers: If set to 2 or more, shortest-path recomputations
+                are distributed over a persistent pool of that many worker
+                processes. Results are identical to the single-process
+                computation. Defaults to ``None`` (compute in-process).
         """
         self._random = random
+        self._rng = np.random.default_rng(seed)
+        if refresh_interval is not None and refresh_interval < 1:
+            raise ValueError("refresh_interval must be a positive number of steps")
+        self._refresh_interval = refresh_interval
+        self._refresh_workers = refresh_workers
+        self._refresh_pool: ProcessPoolExecutor | None = None
         self._nr_vehicles = vehicles.shape[0]
         self._vehicles = Simulator.VehiclesRecord(
             origin=vehicles['origin'].values.astype(np.int32),
@@ -222,15 +288,111 @@ class Simulator:
 
         self._max_lanes = self._edges.lanes.max()
 
-        n_nodes = int(max(edges['from'].max(), edges['to'].max())) + 1
-        self._nodes_to_edge_map = coo_array(
-            (range(self._nr_edges), (edges['from'], edges['to'])),
-            shape=(n_nodes, n_nodes),
-        ).toarray()
+        self._n_nodes = int(max(edges['from'].max(), edges['to'].max())) + 1
+
+        # Sorted-key lookup mapping a (from_node, to_node) pair to its edge
+        # index; O(nr_edges) memory instead of a dense nodes x nodes matrix.
+        keys = (
+            self._edges.from_node.astype(np.int64) * self._n_nodes
+            + self._edges.to_node
+        )
+        order = np.argsort(keys)
+        self._edge_lookup_keys = keys[order]
+        self._edge_lookup_values = order.astype(np.int32)
+
+        # Vehicle indices ordered by start time, so that the vehicles starting
+        # at a given step form a contiguous slice found by bisection.
+        self._start_order = np.argsort(
+            self._vehicles.start_time, kind='stable'
+        ).astype(np.int32)
+        self._sorted_start_times = self._vehicles.start_time[self._start_order]
+
+        # Sorted indices of the vehicles currently in the network (AT_NODE or
+        # IN_EDGE): per-step work scales with this set, not with the total
+        # number of vehicles.
+        self._active = np.empty(0, dtype=np.int32)
 
         self._next_leg: np.ndarray | None = None
+        # Row index into _next_leg for each destination node (-1 when the node
+        # is not a destination of any vehicle).
+        self._dest_row: np.ndarray | None = None
+        # Unique destination nodes: the Dijkstra sources (from/to inverted).
+        self._route_targets: np.ndarray | None = None
+        # Last step for which _next_leg is guaranteed fresh. Bounded only by
+        # horizon-limited refreshes; see step(horizon=...).
+        self._route_valid_until = Simulator.END_OF_TIME
         self._ready = False
         self._now = 0
+
+    def _shortest_paths_to(self, targets: np.ndarray, travel_time) -> np.ndarray:
+        """Compute next-hop predecessor rows towards each target node.
+
+        Note that from/to are inverted so that Dijkstra, run from each target,
+        returns the *successor* node on the path from any node to that target.
+
+        When ``refresh_workers`` is configured, the targets are split over a
+        persistent pool of worker processes; each target's computation is
+        independent, so the result is identical to the in-process one.
+
+        Args:
+            targets: Destination node indices (the Dijkstra sources).
+            travel_time: Per-edge travel time to use as the edge weight.
+
+        Returns:
+            Predecessor matrix of shape ``(len(targets), nr_nodes)``.
+        """
+        workers = self._refresh_workers
+        if workers is not None and workers > 1 and len(targets) > 1:
+            if self._refresh_pool is None:
+                self._refresh_pool = ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_refresh_pool_initializer,
+                    initargs=(self._edges.to_node, self._edges.from_node, self._n_nodes),
+                )
+            travel_time = np.asarray(travel_time)
+            chunks = [c for c in np.array_split(targets, workers) if len(c) > 0]
+            predecessors = self._refresh_pool.map(
+                _refresh_pool_worker, [(travel_time, c) for c in chunks]
+            )
+            return np.vstack(list(predecessors))
+
+        graph = csr_array(
+            (travel_time, (self._edges.to_node, self._edges.from_node)),
+            shape=(self._n_nodes, self._n_nodes),
+        )
+        _, predecessors = shortest_path_search(
+            graph, return_predecessors=True, indices=targets
+        )
+        return predecessors
+
+    def close(self) -> None:
+        """Release resources held by the simulator.
+
+        Shuts down the worker-process pool used for parallel shortest-path
+        recomputation, if one was started. The simulator remains usable; a
+        new pool is started on demand.
+        """
+        if self._refresh_pool is not None:
+            self._refresh_pool.shutdown()
+            self._refresh_pool = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _edges_between(self, from_nodes: np.ndarray, to_nodes: np.ndarray) -> np.ndarray:
+        """Return the edge index for each (from, to) node pair.
+
+        All requested pairs must correspond to existing edges (as is the case
+        for consecutive nodes on a shortest path).
+        """
+        keys = from_nodes.astype(np.int64) * self._n_nodes + to_nodes
+        pos = np.searchsorted(self._edge_lookup_keys, keys)
+        assert (pos < len(self._edge_lookup_keys)).all()
+        assert (self._edge_lookup_keys[pos] == keys).all()
+        return self._edge_lookup_values[pos]
 
     @classmethod
     def build(
@@ -240,6 +402,9 @@ class Simulator:
         *,
         fix_unreachable: bool = False,
         random: bool = False,
+        seed: int | np.random.Generator | None = None,
+        refresh_interval: int | None = None,
+        refresh_workers: int | None = None,
     ) -> tuple['Simulator', list[int]]:
         """Construct a fully initialised simulator ready to run.
 
@@ -262,6 +427,19 @@ class Simulator:
             random: If ``True``, vehicles competing for the same edge are
                 shuffled randomly before priority is assigned. Defaults to
                 ``False`` (deterministic, first-in-first-served).
+            seed: Seed (or ready-made :class:`numpy.random.Generator`) for the
+                shuffling performed when ``random=True``. Passing an integer
+                makes random runs reproducible. Defaults to ``None``
+                (fresh entropy on every run).
+            refresh_interval: If set, :meth:`step` triggers the shortest-path
+                recomputation automatically every ``refresh_interval`` steps
+                (with the matching horizon), so callers no longer need to pass
+                ``update_next_leg``/``horizon``. Defaults to ``None`` (caller
+                -driven refreshes only).
+            refresh_workers: If set to 2 or more, shortest-path recomputations
+                are distributed over a persistent pool of that many worker
+                processes. Results are identical to the single-process
+                computation. Defaults to ``None`` (compute in-process).
 
         Returns:
             A two-tuple ``(simulator, fixed)`` where *simulator* is ready to
@@ -273,23 +451,31 @@ class Simulator:
             ValueError: If ``fix_unreachable=False`` and one or more vehicles
                 have unreachable destinations.
         """
-        simulator = cls(edges, vehicles, random=random)
+        simulator = cls(
+            edges, vehicles, random=random, seed=seed,
+            refresh_interval=refresh_interval, refresh_workers=refresh_workers,
+        )
 
-        # Compute the routing.
-        # Note that from/to are inverted so that Dijkstra returns the *successor*
-        # node on the path from each source to each destination.
-        n_nodes = simulator._nodes_to_edge_map.shape[0]
-        graph = coo_array(
-            (edges['length'] / edges['speed'], (edges['to'], edges['from'])),
-            shape=(n_nodes, n_nodes),
-        ).toarray()
-        _, simulator._next_leg = shortest_path_search(graph, return_predecessors=True)
+        # Compute the routing with free-flow speeds. Dijkstra runs only from
+        # the nodes that are actual vehicle destinations, so _next_leg has one
+        # row per unique destination (indexed via _dest_row) instead of one
+        # row per node. All destination rows are needed here (not only those
+        # within some departure horizon) because the reachability check below
+        # inspects every vehicle regardless of its start time.
+        simulator._route_targets = np.unique(simulator._vehicles.destination)
+        simulator._dest_row = np.full(simulator._n_nodes, -1, dtype=np.int32)
+        simulator._dest_row[simulator._route_targets] = np.arange(
+            len(simulator._route_targets), dtype=np.int32
+        )
+        simulator._next_leg = simulator._shortest_paths_to(
+            simulator._route_targets, edges['length'] / edges['speed']
+        )
 
         # Check for vehicles with unreachable destinations
         unreachable_mask = (
             (simulator._vehicles.destination != simulator._vehicles.origin) &
             (simulator._next_leg[
-                simulator._vehicles.destination,
+                simulator._dest_row[simulator._vehicles.destination],
                 simulator._vehicles.origin,
             ] == -9999)
         )
@@ -300,6 +486,9 @@ class Simulator:
                     f"{unreachable_mask.sum()} vehicle(s) have unreachable destinations. "
                     "Pass fix_unreachable=True to reroute them to their origin."
                 )
+            # The new destination may have no _dest_row entry, but these
+            # vehicles arrive at start (node == destination) without ever
+            # querying the routing.
             simulator._vehicles.destination[unreachable_mask] = (
                 simulator._vehicles.origin[unreachable_mask]
             )
@@ -328,7 +517,7 @@ class Simulator:
         """
         return self._edges
 
-    def step(self, update_next_leg: bool = False) -> None:
+    def step(self, update_next_leg: bool = False, horizon: int | None = None) -> None:
         """Advance the simulation by one time step.
 
         The method updates vehicle states in the following order:
@@ -340,16 +529,35 @@ class Simulator:
         3. **Arrived** — vehicles at their destination node transition to
            ``ARRIVED``.
         4. **Entering edge** — vehicles at a node attempt to enter the next
-           edge on their shortest path. The loop repeats until no more
-           vehicles can enter (handles multi-hop moves within one step).
+           edge on their shortest path. Admission is decided against the lane
+           state at the beginning of this phase: each lane with enough room
+           admits one vehicle, and lanes vacated during this same step become
+           available only in the next step.
         5. **Progress** — vehicles in edges advance by their edge speed, up
            to the front vehicle's position minus ``DELTA``.
+
+        When the simulator was built with ``refresh_interval``, the
+        shortest-path recomputation is triggered automatically every
+        ``refresh_interval`` steps and these arguments are not needed.
 
         Args:
             update_next_leg: If ``True``, recompute shortest paths using
                 instantaneous measured speeds after updating vehicle positions.
                 This is expensive and is typically done only every few hundred
                 steps. Defaults to ``False``.
+            horizon: Upper bound, in steps, on the interval until the *next*
+                shortest-path recomputation. When given, only the routing rows
+                that can be read before then are recomputed: those of
+                destinations of vehicles currently in the network or departing
+                within ``horizon`` steps. This is much cheaper and produces
+                identical results, provided the caller does recompute at least
+                every ``horizon`` steps. Defaults to ``None`` (recompute all
+                rows). Only meaningful together with ``update_next_leg=True``.
+
+        Raises:
+            RuntimeError: If the simulator was not built with :meth:`build`,
+                or if routing data is read after a promised ``horizon`` has
+                elapsed without the corresponding recomputation.
         """
         if not self._ready:
             raise RuntimeError(
@@ -358,6 +566,15 @@ class Simulator:
             )
         assert self._next_leg is not None
         next_leg: np.ndarray = self._next_leg
+
+        # Automatic refresh: same cadence and semantics as a caller passing
+        # update_next_leg=True with horizon=refresh_interval every
+        # refresh_interval steps. An explicit update_next_leg call keeps its
+        # own horizon.
+        if not update_next_leg and self._refresh_interval is not None:
+            if (self._now + 1) % self._refresh_interval == 0:
+                update_next_leg = True
+                horizon = self._refresh_interval
 
         waiting_status = Simulator.VehicleStatus.WAITING.value
         at_node_status = Simulator.VehicleStatus.AT_NODE.value
@@ -369,144 +586,197 @@ class Simulator:
         self._vehicles.entered_edge_now[:] = False
 
         def do_starting() -> None:
-            # Find vehicles that are ready to start
-            starting = (self._vehicles.start_time == self._now) & (self._vehicles.status == waiting_status)
-            if np.any(starting):
+            # Find vehicles that are ready to start: a contiguous slice of the
+            # start-time-ordered vehicle indices.
+            # Search with matching dtype: passing Python ints would promote
+            # (and copy) the whole sorted array to int64 on every step.
+            lo, hi = np.searchsorted(
+                self._sorted_start_times,
+                np.array([self._now, self._now + 1], dtype=self._sorted_start_times.dtype),
+            )
+            starting = self._start_order[lo:hi]
+            starting = starting[self._vehicles.status[starting] == waiting_status]
+            if len(starting) > 0:
                 self._vehicles.status[starting] = at_node_status
                 self._vehicles.started_now[starting] = True
+                # Merge into the sorted active-vehicle set
+                starting = np.sort(starting)
+                self._active = np.insert(
+                    self._active, np.searchsorted(self._active, starting), starting
+                )
 
         do_starting()
 
         def do_out_of_edge() -> None:
             # Find vehicles that have reached the end of their edge
-            vehicles = (
-                (self._vehicles.status == in_edge_status) &
-                (self._vehicles.edge_distance == self._edges.length[self._vehicles.edge])
-            )
+            active = self._active
+            in_edge_v = active[self._vehicles.status[active] == in_edge_status]
+            vehicles = in_edge_v[
+                self._vehicles.edge_distance[in_edge_v]
+                == self._edges.length[self._vehicles.edge[in_edge_v]]
+            ]
             self._vehicles.status[vehicles] = at_node_status
 
         do_out_of_edge()
 
         def do_arrived() -> None:
             # Find vehicles that reached their final destination
-            arrived = (
-                (self._vehicles.status == at_node_status) &
-                (self._vehicles.node == self._vehicles.destination)
-            )
-            if np.any(arrived):
+            active = self._active
+            at_node_v = active[self._vehicles.status[active] == at_node_status]
+            arrived = at_node_v[
+                self._vehicles.node[at_node_v] == self._vehicles.destination[at_node_v]
+            ]
+            if len(arrived) > 0:
                 self._vehicles.status[arrived] = arrived_status
                 self._vehicles.arrival_time[arrived] = self._now
                 self._vehicles.arrived_now[arrived] = True
 
                 # Restrict to vehicles that did not start right away (origin == destination)
-                arrived_not_started = arrived & (self._vehicles.edge >= 0)
+                arrived_not_started = arrived[self._vehicles.edge[arrived] >= 0]
                 # Restrict to vehicles that are last in their lane
-                in_out_vehicles = (
+                in_out_vehicles = arrived_not_started[
                     self._edges.last_vehicle[
                         self._vehicles.edge[arrived_not_started],
                         self._vehicles.lane[arrived_not_started],
-                    ] == arrived_not_started.nonzero()[0]
-                )
-                in_out_vehicles = arrived_not_started.nonzero()[0][in_out_vehicles]
+                    ] == arrived_not_started
+                ]
                 # Mark those lanes as empty
                 self._edges.last_vehicle[
                     self._vehicles.edge[in_out_vehicles],
                     self._vehicles.lane[in_out_vehicles],
                 ] = -1
-                # Reset edge and lane for arrived vehicles
+                # Reset edge, lane and front pointer for arrived vehicles
                 self._vehicles.edge[arrived_not_started] = -1
                 self._vehicles.lane[arrived_not_started] = -1
+                self._vehicles.lane_front_vehicle[arrived_not_started] = -1
+                # Arrived vehicles leave the active set
+                self._active = active[self._vehicles.status[active] != arrived_status]
 
         do_arrived()
 
         def do_entering_edge() -> None:
-            while True:
-                # Find vehicles that should enter an edge
-                entering_edge = (self._vehicles.status == at_node_status)
-                if not np.any(entering_edge):
-                    break
-                # Compute the next node and edge.
-                # Note that from/to are inverted in _next_leg.
-                next_nodes = next_leg[
-                    self._vehicles.destination[entering_edge],
-                    self._vehicles.node[entering_edge],
-                ]
-                next_edges = self._nodes_to_edge_map[
-                    self._vehicles.node[entering_edge], next_nodes
-                ]
-
-                assert not (next_nodes == -9999).any()
-
-                # Get unique edges targeted by the vehicles, and the corresponding vehicles.
-                # Shuffling is performed for random simulations.
-                if self._random:
-                    order = np.arange(len(next_edges))
-                    np.random.shuffle(order)
-                    unique_edges, unique_vehicles = np.unique(next_edges[order], return_index=True)
-                    unique_vehicles = order[unique_vehicles]
-                else:
-                    unique_edges, unique_vehicles = np.unique(next_edges, return_index=True)
-
-                # Restrict to edges that have at least one free lane
-                lane_distances = np.select(
-                    [
-                        self._edges.last_vehicle[unique_edges] == -1,
-                        self._edges.last_vehicle[unique_edges] < -1,
-                        True,
-                    ],
-                    [
-                        999_999.9,
-                        0.0,
-                        self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]],
-                    ],
+            # Find vehicles that should enter an edge (_active is sorted, so
+            # candidates are in ascending vehicle-index order).
+            # Note that from/to are inverted in _next_leg.
+            candidates = self._active[
+                self._vehicles.status[self._active] == at_node_status
+            ]
+            if len(candidates) == 0:
+                return
+            if self._now > self._route_valid_until:
+                raise RuntimeError(
+                    "Routing data may be stale: the last shortest-path "
+                    f"recomputation promised a refresh within its horizon "
+                    f"(by step {self._route_valid_until}), but none happened "
+                    f"by step {self._now}. Call step(update_next_leg=True) "
+                    "at least every `horizon` steps, or pass horizon=None."
                 )
-                free_edges = (lane_distances >= Simulator.DELTA).any(axis=1)
+            dest_rows = self._dest_row[self._vehicles.destination[candidates]]
+            assert (dest_rows >= 0).all()
+            next_nodes = next_leg[
+                dest_rows,
+                self._vehicles.node[candidates],
+            ]
 
-                if not free_edges.any():
-                    break
+            assert not (next_nodes == -9999).any()
 
-                edges = unique_edges[free_edges]
-                lanes = np.argmax(lane_distances[free_edges], axis=1)
-                vehicles = entering_edge.nonzero()[0][unique_vehicles[free_edges]]
-                assert not (self._edges.last_vehicle[edges, lanes] < -1).any()
+            next_edges = self._edges_between(
+                self._vehicles.node[candidates], next_nodes
+            )
 
-                # If a vehicle was last in its previous lane, mark that lane as empty
-                in_out_vehicles = (
-                    (self._vehicles.edge[vehicles] != -1) &
-                    (self._edges.last_vehicle[
-                        self._vehicles.edge[vehicles],
-                        self._vehicles.lane[vehicles],
-                    ] == vehicles)
-                )
-                self._edges.last_vehicle[
-                    self._vehicles.edge[vehicles[in_out_vehicles]],
-                    self._vehicles.lane[vehicles[in_out_vehicles]],
-                ] = -1
+            # Priority among vehicles competing for the same edge: vehicle
+            # index order, or a random order for random simulations.
+            if self._random:
+                priority = self._rng.permutation(len(candidates))
+                candidates = candidates[priority]
+                next_nodes = next_nodes[priority]
+                next_edges = next_edges[priority]
 
-                # Transition to IN_EDGE and update all auxiliary fields
-                self._vehicles.status[vehicles] = in_edge_status
-                self._vehicles.entered_edge_now[vehicles] = True
-                self._vehicles.edge[vehicles] = edges
-                self._vehicles.lane[vehicles] = lanes
-                self._vehicles.node[vehicles] = next_nodes[unique_vehicles[free_edges]]
-                self._vehicles.edge_distance[vehicles] = 0.0
-                self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
-                self._edges.last_vehicle[edges, lanes] = vehicles
-                self._edges.nr_vehicles[edges] += 1
+            # Group the candidates by target edge, keeping the priority order
+            # within each group.
+            grouping = np.argsort(next_edges, kind='stable')
+            candidates = candidates[grouping]
+            next_nodes = next_nodes[grouping]
+            next_edges = next_edges[grouping]
+            unique_edges, group_start, group_size = np.unique(
+                next_edges, return_index=True, return_counts=True
+            )
+
+            # Lane gaps as of the beginning of this phase: lanes vacated by
+            # vehicles moving on during this same step only become available
+            # in the next step.
+            lane_distances = np.select(
+                [
+                    self._edges.last_vehicle[unique_edges] == -1,
+                    self._edges.last_vehicle[unique_edges] < -1,
+                    True,
+                ],
+                [
+                    999_999.9,
+                    0.0,
+                    self._vehicles.edge_distance[self._edges.last_vehicle[unique_edges]],
+                ],
+            )
+
+            # Each lane with a gap of at least DELTA admits exactly one
+            # vehicle (it enters at distance 0, leaving no room for another).
+            # Per edge, the first free_lanes[group] candidates in priority
+            # order are admitted, filling the qualifying lanes in
+            # decreasing-gap order (ties broken by lane index).
+            free_lanes = (lane_distances >= Simulator.DELTA).sum(axis=1)
+            group_id = np.repeat(np.arange(len(unique_edges)), group_size)
+            rank = np.arange(len(candidates)) - np.repeat(group_start, group_size)
+            admitted = rank < free_lanes[group_id]
+
+            if not admitted.any():
+                return
+
+            vehicles = candidates[admitted]
+            edges = next_edges[admitted]
+            lane_order = np.argsort(-lane_distances, axis=1, kind='stable')
+            lanes = lane_order[group_id[admitted], rank[admitted]]
+            assert not (self._edges.last_vehicle[edges, lanes] < -1).any()
+
+            # If a vehicle was last in its previous lane, mark that lane as empty
+            in_out_vehicles = (
+                (self._vehicles.edge[vehicles] != -1) &
+                (self._edges.last_vehicle[
+                    self._vehicles.edge[vehicles],
+                    self._vehicles.lane[vehicles],
+                ] == vehicles)
+            )
+            self._edges.last_vehicle[
+                self._vehicles.edge[vehicles[in_out_vehicles]],
+                self._vehicles.lane[vehicles[in_out_vehicles]],
+            ] = -1
+
+            # Transition to IN_EDGE and update all auxiliary fields
+            self._vehicles.status[vehicles] = in_edge_status
+            self._vehicles.entered_edge_now[vehicles] = True
+            self._vehicles.edge[vehicles] = edges
+            self._vehicles.lane[vehicles] = lanes
+            self._vehicles.node[vehicles] = next_nodes[admitted]
+            self._vehicles.edge_distance[vehicles] = 0.0
+            self._vehicles.lane_front_vehicle[vehicles] = self._edges.last_vehicle[edges, lanes]
+            self._edges.last_vehicle[edges, lanes] = vehicles
+            np.add.at(self._edges.nr_vehicles, edges, 1)
 
         do_entering_edge()
 
         def do_progress_vehicles() -> None:
+            active = self._active
             # Clear stale front-vehicle references (front vehicle has changed edge)
-            new_edge_front = (
-                (self._vehicles.lane_front_vehicle != -1) &
-                (self._vehicles.edge != self._vehicles.edge[self._vehicles.lane_front_vehicle])
-            )
+            front_ref = self._vehicles.lane_front_vehicle[active]
+            new_edge_front = active[
+                (front_ref != -1) &
+                (self._vehicles.edge[active] != self._vehicles.edge[front_ref])
+            ]
             self._vehicles.lane_front_vehicle[new_edge_front] = -1
 
-            in_edge = (self._vehicles.status == in_edge_status)
-            in_edge_front = in_edge & (self._vehicles.lane_front_vehicle == -1)
-            in_edge_follow = in_edge & ~in_edge_front
+            in_edge_v = active[self._vehicles.status[active] == in_edge_status]
+            front_of_lane = self._vehicles.lane_front_vehicle[in_edge_v] == -1
+            in_edge_front = in_edge_v[front_of_lane]
+            in_edge_follow = in_edge_v[~front_of_lane]
 
             # Following vehicles advance up to (front vehicle position - DELTA)
             new_distance = np.minimum(
@@ -525,10 +795,39 @@ class Simulator:
                     np.add.at(instant_speed, step_edge, step)
                     unique_edge, count_edge = np.unique(step_edge, return_counts=True)
                     np.divide.at(instant_speed, unique_edge, count_edge)
-                    graph = coo_array(
-                        (self._edges.length / instant_speed, (self._edges.to_node, self._edges.from_node))
-                    ).toarray()
-                    _, self._next_leg = shortest_path_search(graph, return_predecessors=True)
+                    travel_time = self._edges.length / instant_speed
+                    if horizon is None:
+                        self._next_leg = self._shortest_paths_to(
+                            self._route_targets, travel_time
+                        )
+                        self._route_valid_until = Simulator.END_OF_TIME
+                        return
+                    # Restrict the recomputation to the routing rows that can
+                    # be read before the next recomputation: destinations of
+                    # vehicles in the network now or departing within horizon
+                    # steps. The remaining rows are recomputed again before
+                    # any vehicle reads them.
+                    lo, hi = np.searchsorted(
+                        self._sorted_start_times,
+                        np.array(
+                            [self._now, self._now + horizon],
+                            dtype=self._sorted_start_times.dtype,
+                        ),
+                        side='right',
+                    )
+                    targets = np.unique(np.concatenate([
+                        self._vehicles.destination[self._active],
+                        self._vehicles.destination[self._start_order[lo:hi]],
+                    ]))
+                    # Drop destinations without a routing row (vehicles fixed
+                    # by fix_unreachable arrive at start and never route)
+                    targets = targets[self._dest_row[targets] >= 0]
+                    self._route_valid_until = self._now + horizon
+                    if len(targets) == 0:
+                        return
+                    self._next_leg[self._dest_row[targets]] = (
+                        self._shortest_paths_to(targets, travel_time)
+                    )
 
                 do_update_next_leg()
 
@@ -543,6 +842,6 @@ class Simulator:
 
         do_progress_vehicles()
 
-        assert not (self._vehicles.edge_distance < 0.0).any()
+        assert not (self._vehicles.edge_distance[self._active] < 0.0).any()
 
         self._now += 1

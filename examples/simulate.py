@@ -11,6 +11,10 @@ This script reads the input format used by the
 - **Platoons Parquet** — columns: ``platoon_id``, ``second``,
   ``from_node_id``, ``to_node_id``, ``nr_vehicles``
 
+CSV files may alternatively carry a header row (detected by an ``id`` first
+field), in which case OSM-style column names are also accepted: ``u``/``v``
+for the edge endpoints and ``maxspeed_mps`` for the edge speed.
+
 Usage
 -----
 ::
@@ -44,31 +48,44 @@ from fts import Simulator
 # UXSim format I/O helpers
 # ---------------------------------------------------------------------------
 
+def _has_header(csv_file: str) -> bool:
+    """Detect a header row by an ``id`` first field on the first line."""
+    with open(csv_file) as fh:
+        return fh.readline().split(',')[0].strip() == 'id'
+
+
 def _read_input(
     nodes_file: str,
     edges_file: str,
     platoons_file: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load nodes, edges, and vehicles from UXSim-format files."""
-    nodes = pd.read_csv(nodes_file, names=['id', 'x', 'y', 'in-out', 'zone'], index_col='id')
-    edges = pd.read_csv(
-        edges_file,
-        names=['id', 'from', 'to', 'length', 'speed', 'lanes', 'zone'],
-        index_col='id',
-    )
+    if _has_header(nodes_file):
+        nodes = pd.read_csv(nodes_file, index_col='id')
+    else:
+        nodes = pd.read_csv(nodes_file, names=['id', 'x', 'y', 'in-out', 'zone'], index_col='id')
+
+    if _has_header(edges_file):
+        edges = pd.read_csv(edges_file, index_col='id').rename(
+            columns={'u': 'from', 'v': 'to', 'maxspeed_mps': 'speed'}
+        )[['from', 'to', 'length', 'speed', 'lanes']]
+    else:
+        edges = pd.read_csv(
+            edges_file,
+            names=['id', 'from', 'to', 'length', 'speed', 'lanes', 'zone'],
+            index_col='id',
+        )
+
     platoons = pd.read_parquet(platoons_file)[
         ['platoon_id', 'second', 'from_node_id', 'to_node_id', 'nr_vehicles']
     ].set_index('platoon_id')
 
-    nr_vehicles = platoons['nr_vehicles'].sum()
-    platoons['last'] = platoons['nr_vehicles'].cumsum()
-    platoons['first'] = platoons['last'] - platoons['nr_vehicles']
-
-    v = np.zeros(nr_vehicles, dtype=[('origin', np.int64), ('destination', np.int64), ('start', np.int64)])
-    for _, row in platoons.iterrows():
-        v[int(row['first']):int(row['last'])] = (row['from_node_id'], row['to_node_id'], row['second'])
-
-    vehicles = pd.DataFrame(v)
+    repeats = platoons['nr_vehicles'].to_numpy()
+    vehicles = pd.DataFrame({
+        'origin': np.repeat(platoons['from_node_id'].to_numpy(), repeats),
+        'destination': np.repeat(platoons['to_node_id'].to_numpy(), repeats),
+        'start': np.repeat(platoons['second'].to_numpy(), repeats),
+    })
     vehicles.index.name = 'id'
     return nodes, edges, vehicles
 
@@ -82,19 +99,17 @@ def _map_nodes(nodes: pd.DataFrame) -> pd.DataFrame:
 
 def _convert_edges(edges: pd.DataFrame, nodes_map: pd.DataFrame) -> pd.DataFrame:
     """Remap legacy node IDs in edges to sequential indices."""
-    map_node = lambda n: nodes_map['seq'][n]
     converted = edges.copy()
-    converted['from'] = converted['from'].apply(map_node)
-    converted['to'] = converted['to'].apply(map_node)
+    converted['from'] = converted['from'].map(nodes_map['seq'])
+    converted['to'] = converted['to'].map(nodes_map['seq'])
     return converted[['from', 'to', 'length', 'speed', 'lanes']]
 
 
 def _convert_vehicles(vehicles: pd.DataFrame, nodes_map: pd.DataFrame) -> pd.DataFrame:
     """Remap legacy node IDs in vehicles to sequential indices."""
-    map_node = lambda n: nodes_map['seq'][n]
     converted = vehicles.copy()
-    converted['origin'] = converted['origin'].apply(map_node)
-    converted['destination'] = converted['destination'].apply(map_node)
+    converted['origin'] = converted['origin'].map(nodes_map['seq'])
+    converted['destination'] = converted['destination'].map(nodes_map['seq'])
     return pd.DataFrame(converted)
 
 
@@ -123,8 +138,21 @@ def main() -> None:
         help="Randomise vehicle ordering at nodes (default: deterministic)",
     )
     parser.add_argument(
+        '--seed', type=int, metavar='N',
+        help="Random seed for -r mode (makes random runs reproducible)",
+    )
+    parser.add_argument(
+        '--arrivals', metavar='FILE',
+        help="Write per-vehicle arrival times to FILE (Parquet), e.g. for identity testing",
+    )
+    parser.add_argument(
         '--sp', type=int, default=300, metavar='N',
         help="Shortest-path recomputation interval in steps",
+    )
+    parser.add_argument(
+        '--workers', type=int, metavar='N',
+        help="Worker processes for parallel shortest-path recomputation "
+             "(default: single-process)",
     )
     parser.add_argument(
         '--max-vehicles', type=int, metavar='N',
@@ -171,7 +199,8 @@ def main() -> None:
     start_init = time.time()
     simulator, fixed = Simulator.build(
         edges=converted_edges, vehicles=converted_vehicles,
-        fix_unreachable=True, random=args.random,
+        fix_unreachable=True, random=args.random, seed=args.seed,
+        refresh_interval=args.sp, refresh_workers=args.workers,
     )
     if fixed:
         print(f"*** Rerouting {len(fixed)} vehicles with unreachable destinations ***")
@@ -185,17 +214,20 @@ def main() -> None:
     # Run simulation
     print(f"Starting simulation (random={args.random}, SP recomputation every {args.sp} steps)...")
     start_sim = time.time()
-    SP = args.sp
     volume_logs: list[pd.DataFrame] = []
-    trip_logs: list[list] = []
+    # Per-step event batches: (step, vehicle_indices, event_kind, edge_index).
+    # Kinds: 0 = waiting_at_origin_node, 1 = entered edge, 2 = trip_end.
+    # Kept as compact NumPy arrays: a per-event Python list would need ~280
+    # bytes per event (gigabytes for city-scale runs) versus ~26 bytes here.
+    trip_logs: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
     record_trips = args.output is not None
     record_volume = args.traffic_volume is not None
 
     h = 0
     while True:
         for s in range(60 * 60):
-            simulator.step(s % SP == SP - 1)
             abs_step = h * 3600 + s
+            simulator.step()
 
             if record_volume and s % 300 == 299:
                 volume_logs.append(pd.DataFrame({
@@ -206,18 +238,20 @@ def main() -> None:
                 simulator.edges.nr_vehicles = np.zeros_like(simulator.edges.nr_vehicles)
 
             if record_trips:
-                for v in (simulator.vehicles.started_now & ~simulator.vehicles.entered_edge_now).nonzero()[0]:
-                    trip_logs.append([vehicles.index[v], vehicles.iloc[v]['origin'],
-                                      vehicles.iloc[v]['destination'], abs_step,
-                                      "waiting_at_origin_node"])
-                for v in simulator.vehicles.entered_edge_now.nonzero()[0]:
-                    trip_logs.append([vehicles.index[v], vehicles.iloc[v]['origin'],
-                                      vehicles.iloc[v]['destination'], abs_step,
-                                      edges.index[simulator.vehicles.edge[v]]])
-                for v in simulator.vehicles.arrived_now.nonzero()[0]:
-                    trip_logs.append([vehicles.index[v], vehicles.iloc[v]['origin'],
-                                      vehicles.iloc[v]['destination'], abs_step,
-                                      "trip_end"])
+                waiting = (simulator.vehicles.started_now & ~simulator.vehicles.entered_edge_now).nonzero()[0]
+                entered = simulator.vehicles.entered_edge_now.nonzero()[0]
+                arrived = simulator.vehicles.arrived_now.nonzero()[0]
+                if len(waiting) + len(entered) + len(arrived) > 0:
+                    v_idx = np.concatenate([waiting, entered, arrived])
+                    kind = np.repeat(
+                        np.array([0, 1, 2], dtype=np.int8),
+                        [len(waiting), len(entered), len(arrived)],
+                    )
+                    edge_idx = np.full(len(v_idx), -1, dtype=np.int32)
+                    edge_idx[len(waiting):len(waiting) + len(entered)] = (
+                        simulator.vehicles.edge[entered]
+                    )
+                    trip_logs.append((abs_step, v_idx, kind, edge_idx))
 
         h += 1
         nr_waiting = (simulator.vehicles.status == Simulator.VehicleStatus.WAITING.value).sum()
@@ -233,6 +267,8 @@ def main() -> None:
         if nr_waiting + nr_at_node + nr_in_edge == 0:
             break
 
+    simulator.close()
+
     # Write outputs
     if record_volume:
         volume = pd.concat(volume_logs).groupby(['link', 'time']).sum().reset_index()
@@ -240,9 +276,36 @@ def main() -> None:
         print(f"Traffic volume written to {args.traffic_volume}")
 
     if record_trips:
-        trips_df = pd.DataFrame(trip_logs, columns=['name', 'orig', 'dest', 't', 'link'])
+        v_idx = np.concatenate([batch[1] for batch in trip_logs])
+        t = np.concatenate([
+            np.full(len(batch[1]), batch[0], dtype=np.int64) for batch in trip_logs
+        ])
+        kind = np.concatenate([batch[2] for batch in trip_logs])
+        edge_idx = np.concatenate([batch[3] for batch in trip_logs])
+
+        link = np.empty(len(v_idx), dtype=object)
+        link[kind == 0] = 'waiting_at_origin_node'
+        link[kind == 1] = edges.index.astype(str).to_numpy()[edge_idx[kind == 1]]
+        link[kind == 2] = 'trip_end'
+
+        trips_df = pd.DataFrame({
+            'name': vehicles.index.to_numpy()[v_idx],
+            'orig': vehicles['origin'].to_numpy()[v_idx],
+            'dest': vehicles['destination'].to_numpy()[v_idx],
+            't': t,
+            'link': link,
+        })
         trips_df.to_parquet(args.output, index=False)
         print(f"Per-vehicle trip log written to {args.output}")
+
+    if args.arrivals:
+        pd.DataFrame({
+            'origin': converted_vehicles['origin'].values,
+            'destination': converted_vehicles['destination'].values,
+            'start': converted_vehicles['start'].values,
+            'arrival_time': simulator.vehicles.arrival_time,
+        }).to_parquet(args.arrivals)
+        print(f"Per-vehicle arrival times written to {args.arrivals}")
 
     sim_time = time.time() - start_sim
     total_steps = h * 3600
